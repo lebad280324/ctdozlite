@@ -201,6 +201,28 @@ pub async fn sync_phone_messages_opts<F>(
     poll_state: &tokio::sync::Mutex<chat::PollState>,
     threads: &mut Vec<Thread>,
     send_phone_prompt: bool,
+    on_progress: F,
+) -> Result<(usize, usize)>
+where
+    F: FnMut(f32, String),
+{
+    let uin = s.login.as_ref().map(|login| login.uin.as_str()).unwrap_or_default();
+    let db_path = store::db_path_for_account(uin);
+    sync_phone_messages_to(s, poll_state, threads, send_phone_prompt, &db_path, true, on_progress).await
+}
+
+/// Run the existing phone sync workflow against an explicitly owned account store.
+///
+/// `write_legacy_cache` is false for native clients, whose actor persists its own snapshot.
+/// # Errors
+/// Returns existing sync or account-store errors without changing the wire protocol.
+pub async fn sync_phone_messages_to<F>(
+    s: &Session,
+    poll_state: &tokio::sync::Mutex<chat::PollState>,
+    threads: &mut Vec<Thread>,
+    send_phone_prompt: bool,
+    db_path: &str,
+    write_legacy_cache: bool,
     mut on_progress: F,
 ) -> Result<(usize, usize)>
 where
@@ -400,13 +422,11 @@ where
     chat::deduplicate_threads(threads, None);
 
     let snapshot = threads.clone();
-    let uin_str = s.login.as_ref().map(|l| l.uin.clone()).unwrap_or_default();
-    let db_path = store::db_path_for_account(&uin_str);
-    let db_path_clone = db_path.clone();
+    let db_path_clone = db_path.to_string();
     let db_added = tokio::task::spawn_blocking(move || -> Result<usize> {
         let mut st = MessageStore::open(&db_path_clone)?;
         let n = store::persist_threads(&mut st, &snapshot)?;
-        chat::save_threads_cache(&snapshot);
+        if write_legacy_cache { chat::save_threads_cache(&snapshot); }
         Ok(n)
     })
     .await??;
@@ -428,6 +448,23 @@ pub async fn import_mobile_backup_container(
     s: &Session,
     url: &str,
     encrypted_key: &str,
+) -> Result<usize> {
+    let count = import_mobile_backup_container_to(s, url, encrypted_key, DB_PATH).await?;
+    let mut cached = crate::chat::load_threads_cache();
+    let store = MessageStore::open(DB_PATH)?;
+    store.hydrate_threads(&mut cached, 50)?;
+    crate::chat::save_threads_cache(&cached);
+    Ok(count)
+}
+
+/// Import a phone backup into the caller's account database, never a global store.
+/// # Errors
+/// Returns existing download, decryption, parsing or store failures.
+pub async fn import_mobile_backup_container_to(
+    s: &Session,
+    url: &str,
+    encrypted_key: &str,
+    db_path: &str,
 ) -> Result<usize> {
     use aes::cipher::{BlockDecryptMut, KeyIvInit};
     use base64::Engine;
@@ -583,7 +620,7 @@ pub async fn import_mobile_backup_container(
         }
     }
 
-    let mut store = crate::store::MessageStore::open("zalo_history.db")?;
+    let mut store = crate::store::MessageStore::open(db_path)?;
     let temp_dir = std::env::temp_dir().join(format!("ctdozlite_sync_{}", crate::param_cipher::random_hex(8)));
     let _ = std::fs::create_dir_all(&temp_dir);
 
@@ -604,6 +641,11 @@ pub async fn import_mobile_backup_container(
             continue;
         };
 
+        if std::path::Path::new(&name).components().count() != 1
+            || std::path::Path::new(&name).file_name().is_none()
+        {
+            anyhow::bail!("invalid backup entry name");
+        }
         let temp_db_path = temp_dir.join(&name);
         if std::fs::write(&temp_db_path, db_bytes).is_err() {
             continue;
@@ -716,9 +758,7 @@ pub async fn import_mobile_backup_container(
 
     let _ = std::fs::remove_dir_all(&temp_dir);
 
-    let mut cached_threads = crate::chat::load_threads_cache();
-    let _ = store.hydrate_threads(&mut cached_threads, 50);
-    crate::chat::save_threads_cache(&cached_threads);
+
 
     // Notify Zalo server and phone that snapshot is downloaded, dismissing mobile spinner
     let _ = crate::chat::clean_sync(s, &pub_key_b64).await;
@@ -996,6 +1036,20 @@ pub fn parse_sync_chunk(buf: &[u8]) -> Option<Vec<ParsedProtoPartition>> {
 }
 
 pub async fn import_sync_v2_messages(s: &Session, url: &str) -> Result<usize> {
+    let uin = s.login.as_ref().map(|login| login.uin.as_str()).unwrap_or_default();
+    let db_path = store::db_path_for_account(uin);
+    let count = import_sync_v2_messages_to(s, url, &db_path).await?;
+    let mut cached = crate::chat::load_threads_cache();
+    let store = MessageStore::open(&db_path)?;
+    store.hydrate_threads(&mut cached, 50)?;
+    crate::chat::save_threads_cache(&cached);
+    Ok(count)
+}
+
+/// Import the existing Sync v2 wire payload into the explicitly owned account store.
+/// # Errors
+/// Returns existing download, decode, helper or store errors.
+pub async fn import_sync_v2_messages_to(s: &Session, url: &str, db_path: &str) -> Result<usize> {
     let uin = s.login.as_ref().map(|l| l.uin.clone()).unwrap_or_default();
     let sek = s.zpw_sek.clone().unwrap_or_default();
     let cookie_hdr = format!("zpw_sek={sek}; zpw_uin={uin}");
@@ -1031,8 +1085,7 @@ pub async fn import_sync_v2_messages(s: &Session, url: &str) -> Result<usize> {
     };
 
     let partitions = parse_sync_chunk(&decompressed).unwrap_or_default();
-    let db_path = crate::store::db_path_for_account(&uin);
-    let mut store = crate::store::MessageStore::open(&db_path)?;
+    let mut store = crate::store::MessageStore::open(db_path)?;
     let my_name = s.login.as_ref().map(|l| l.display_name.clone()).unwrap_or_else(|| "Tôi".into());
 
     let mut imported = 0;
@@ -1065,9 +1118,7 @@ pub async fn import_sync_v2_messages(s: &Session, url: &str) -> Result<usize> {
         }
     }
 
-    let mut cached_threads = crate::chat::load_threads_cache();
-    let _ = store.hydrate_threads(&mut cached_threads, 50);
-    crate::chat::save_threads_cache(&cached_threads);
+
 
     if let Some(pub_k) = get_sync_public_key() {
         let _ = crate::chat::clean_sync(s, &pub_k).await;

@@ -13,6 +13,8 @@ pub const SERVICE_MAP_V3: &[(&str, &str)] = &[
     ("conversation", "https://tt-convers-wpa.chat.zalo.me"),
     ("chat", "https://tt-chat3-wpa.chat.zalo.me"),
     ("group", "https://tt-group-wpa.chat.zalo.me"),
+    // Existing desktop pinned-topic reader uses this service (native BA migration).
+    ("group_board", "https://groupboard-wpa.chat.zalo.me"),
     ("sticker", "https://tt-sticker-wpa.chat.zalo.me"),
     ("alias", "https://tt-alias-wpa.chat.zalo.me"),
     ("label", "https://label-wpa.chat.zalo.me"),
@@ -34,6 +36,12 @@ pub const AUTH: &str = "https://wpa.zaloapp.com";
 
 /// Base host that serves `getServerInfo` for an authenticated web session.
 pub const WPA_CHAT: &str = "https://wpa.chat.zalo.me";
+
+/// Public sticker image CDN used by the existing desktop sticker renderer.
+pub const STICKER_CDN: &str = "https://api.zaloapp.com";
+
+/// Existing mobile backup CDN suffixes accepted by the native sync adapter.
+pub const MOBILE_BACKUP_DOMAINS: &[&str] = &["zalo.me", "zaloapp.com", "zdn.vn", "zadn.vn"];
 
 /// Look up a service domain by key.
 pub fn service(key: &str) -> Option<&'static str> {

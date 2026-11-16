@@ -392,6 +392,10 @@ pub struct LoginInfo {
     pub send2me_id: String,
     #[serde(default)]
     pub avatar: String,
+    /// `dkey` from `getLoginInfo` — the account data key that Zalo PC uses to
+    /// encrypt its `.zl.zip` exports. Secret; absent in files from older builds.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub dkey: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

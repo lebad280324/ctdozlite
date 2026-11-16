@@ -65,6 +65,12 @@ pub struct ChatMessage {
     pub link_thumb: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub link_src: Option<String>,
+    /// Copy of the attachment on this Mac, imported from a Zalo PC export (re-notes/64).
+    #[serde(default)]
+    pub local_path: Option<String>,
+    /// Structured card Zalo sends as an attachment object: contact, call, notice (re-notes/65).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub card: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub history_source: Option<Value>,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
@@ -99,8 +105,20 @@ impl ChatMessage {
         if incoming.history_source.is_some() {
             self.history_source = incoming.history_source.clone();
         }
+        // A cached copy parsed before rich cards were read takes the card and its wording.
+        let card_changed = self.card.is_none() && incoming.card.is_some();
+        if card_changed {
+            self.card = incoming.card.clone();
+            self.text = incoming.text.clone();
+            self.link_url = incoming.link_url.clone();
+            self.link_title = incoming.link_title.clone();
+            self.link_desc = incoming.link_desc.clone();
+            self.link_thumb = incoming.link_thumb.clone();
+            self.link_src = incoming.link_src.clone();
+        }
         self.delivery = self.delivery.merge(incoming.delivery);
-        previous_mentions != self.resolved_mention_uids
+        card_changed
+            || previous_mentions != self.resolved_mention_uids
             || before
                 != (
                     self.kind,
@@ -2899,6 +2917,73 @@ pub async fn fetch_sticker_pack_items(
     Ok(items)
 }
 
+/// Animation data for one sticker from the same `sticker_detail` response used by
+/// [`fetch_sticker_pack_items`]: a horizontal sprite strip, its frame count and total
+/// per-frame interval in milliseconds (Zalo PC uses it as the `setInterval` period). See `re-notes/53_sticker_sprite_animation.md`.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct StickerArt {
+    pub sprite_url: String,
+    pub total_frames: u32,
+    pub duration_ms: u32,
+}
+
+/// Extracts sprite animation fields from `sticker_detail` rows; static stickers are skipped.
+pub fn parse_sticker_art(rows: &[Value]) -> std::collections::BTreeMap<u64, StickerArt> {
+    let mut out = std::collections::BTreeMap::new();
+    for row in rows {
+        let Some(id) = row.get("id").or_else(|| row.get("stickerId")).and_then(Value::as_u64) else { continue };
+        let sprite = row.get("stickerSpriteUrl").and_then(Value::as_str).unwrap_or_default();
+        let frames = row.get("totalFrames").and_then(Value::as_u64).unwrap_or(0) as u32;
+        let duration = row.get("duration").and_then(Value::as_u64).unwrap_or(0) as u32;
+        if sprite.starts_with("https://") && frames > 1 && frames <= 600 {
+            out.insert(id, StickerArt { sprite_url: sprite.to_owned(), total_frames: frames, duration_ms: if duration == 0 { 250 } else { duration.clamp(16, 2_000) } });
+        }
+    }
+    out
+}
+
+/// Fetch sprite animation data for a sticker category, cached beside the item list.
+pub async fn fetch_sticker_pack_art(
+    s: &Session,
+    cate_id: u64,
+) -> Result<std::collections::BTreeMap<u64, StickerArt>> {
+    if cate_id == 0 {
+        return Ok(Default::default());
+    }
+    let cache_dir = std::path::Path::new("stickers_cache");
+    let _ = std::fs::create_dir_all(cache_dir);
+    let cache_path = cache_dir.join(format!("art_v1_{cate_id}.json"));
+    if let Ok(raw) = std::fs::read_to_string(&cache_path) {
+        if let Ok(cached) = serde_json::from_str(&raw) {
+            return Ok(cached);
+        }
+    }
+    if s.login.is_none() {
+        anyhow::bail!("chưa đăng nhập");
+    }
+    let sticker_host = if s.domains.sticker.is_empty() {
+        "https://tt-sticker-wpa.chat.zalo.me"
+    } else {
+        s.domains.sticker.trim_end_matches('/')
+    };
+    // Same request and parameters as `fetch_sticker_pack_items`; only more response fields are read.
+    let params = s.encoded_params(&json!({ "cid": cate_id.to_string() }))?;
+    let url = format!(
+        "{sticker_host}/api/message/sticker/category/sticker_detail?{}&params={params}",
+        s.common_params()
+    );
+    let resp = s.get(&url).await?;
+    let dec = s.maybe_decrypt(resp, s.session_key_bytes()).await;
+    let rows = dec.get("data").and_then(Value::as_array).or_else(|| dec.as_array()).cloned().unwrap_or_default();
+    let art = parse_sticker_art(&rows);
+    if !rows.is_empty() {
+        if let Ok(text) = serde_json::to_string(&art) {
+            let _ = std::fs::write(&cache_path, text);
+        }
+    }
+    Ok(art)
+}
+
 /// Normalize a sticker keyword by converting non-breaking spaces (`\u{a0}`), collapsing
 /// consecutive whitespace to a single ASCII space, and converting to lowercase.
 pub fn normalize_sticker_keyword(s: &str) -> String {
@@ -3537,12 +3622,15 @@ pub fn icon_to_emoji(icon: &str) -> &'static str {
 /// Map a visual reaction emoji or Zalo reaction code to `(rIcon, rType)` (`compact-app-pc.js:10848900`).
 pub fn reaction_code_and_type(emoji_or_code: &str) -> (&'static str, i32) {
     match emoji_or_code {
+        // Removing one's reaction: Zalo PC's reaction bar sends `{rType: -1, rIcon: ""}` (installed
+        // app bundle, 2026-11-14). It used to fall through to the default and send a heart.
+        "" => ("", -1),
         "👍" | "/-strong" => ("/-strong", 3),
         "❤️" | "❤" | "/-heart" => ("/-heart", 5),
-        "😆" | ":>" => (":>", 0),
+        "😆" | "😂" | ":>" => (":>", 0),
         "😮" | ":o" => (":o", 32),
         "😢" | ":-(( " | ":-((" => (":-((", 2),
-        "😠" | ":-h" => (":-h", 20),
+        "😠" | "😡" | ":-h" => (":-h", 20),
         _ => ("/-heart", 5),
     }
 }
@@ -4720,6 +4808,38 @@ pub async fn poll_new_messages(
     Ok(())
 }
 
+/// Marker stored in `link_src` for shared locations.
+pub const LOCATION_LINK_SRC: &str = "Vị trí Zalo";
+
+/// Map link for a shared point; the native client draws its own map preview from it.
+pub fn location_map_url(lat: f64, lo: f64) -> String {
+    format!("https://maps.google.com/maps?q={lat:.6},{lo:.6}&z=15")
+}
+
+/// Reads `{lat, lo, title}` (Zalo PC `card--location`), also when nested in a JSON `params` string.
+pub fn location_point(v: &Value) -> Option<(f64, f64, Option<String>)> {
+    let number = |value: Option<&Value>| -> Option<f64> {
+        let value = value?;
+        value.as_f64().or_else(|| value.as_str()?.trim().parse().ok())
+    };
+    let object = v.as_object()?;
+    let lat = number(object.get("lat").or_else(|| object.get("latitude")));
+    let lo = number(object.get("lo").or_else(|| object.get("lng")).or_else(|| object.get("longitude")));
+    let title = ["title", "desc", "description", "address"].iter()
+        .find_map(|key| object.get(*key).and_then(Value::as_str))
+        .map(str::to_owned);
+    match (lat, lo) {
+        (Some(lat), Some(lo)) if (-90.0..=90.0).contains(&lat) && (-180.0..=180.0).contains(&lo) && (lat != 0.0 || lo != 0.0) => {
+            Some((lat, lo, title))
+        }
+        _ => {
+            let nested: Value = serde_json::from_str(object.get("params")?.as_str()?).ok()?;
+            let (lat, lo, inner) = location_point(&nested)?;
+            Some((lat, lo, title.or(inner)))
+        }
+    }
+}
+
 fn extract_content_text(v: &Value) -> Option<String> {
     match v {
         Value::String(s) => {
@@ -5073,6 +5193,140 @@ fn extract_link_info(
         _ => (None, None, None, None, None),
     }
 }
+/// A structured Zalo attachment that is not a link, photo or file (re-notes/65_rich_cards.md).
+#[derive(Debug, Clone, PartialEq)]
+pub enum RichCard {
+    /// `recommened.user`: a shared contact (name card).
+    Contact { user_id: String, name: String, avatar: Option<String>, qr: Option<String> },
+    /// `recommened.calltime` / `recommened.misscall`; `duration` in seconds.
+    Call { duration: i64, video: bool, missed: bool },
+    /// Generated event line (`msginfo.actionlist`, `vote`), already worded.
+    Notice(String),
+    /// Official-account template (`zinstant`) with only its preview text readable.
+    Text(String),
+    /// Official-account article list (`chat.list`): its first article.
+    Article { url: Option<String>, title: String, desc: Option<String>, thumb: Option<String> },
+}
+
+fn json_field(value: Option<&Value>) -> Option<Value> {
+    match value? {
+        Value::String(text) => {
+            let trimmed = text.trim();
+            (trimmed.starts_with('{') || trimmed.starts_with('['))
+                .then(|| serde_json::from_str(trimmed).ok())
+                .flatten()
+        }
+        other @ (Value::Object(_) | Value::Array(_)) => Some(other.clone()),
+        _ => None,
+    }
+}
+
+fn text_field(value: Option<&Value>) -> Option<String> {
+    match value? {
+        Value::String(text) if !text.trim().is_empty() => Some(text.trim().to_string()),
+        Value::Number(number) => Some(number.to_string()),
+        _ => None,
+    }
+}
+
+fn web_field(value: Option<&Value>) -> Option<String> {
+    text_field(value).filter(|url| url.starts_with("https://") || url.starts_with("http://"))
+}
+
+/// Fills `%1$s`, `%2$s`… in a Zalo event template.
+fn fill_template(template: &str, values: &[String]) -> String {
+    let mut out = template.to_string();
+    for (index, value) in values.iter().enumerate() {
+        out = out.replace(&format!("%{}$s", index + 1), value);
+    }
+    out.replace("%s", values.first().map(String::as_str).unwrap_or(""))
+}
+
+/// Reads a rich attachment from a message `content` (object, JSON text or list).
+pub fn rich_card(content: &Value) -> Option<RichCard> {
+    let parsed = match content {
+        Value::String(_) => json_field(Some(content))?,
+        other => other.clone(),
+    };
+    if let Value::Array(items) = &parsed {
+        let first = items.iter().find(|item| item.is_object())?;
+        let title = text_field(first.get("title")).or_else(|| text_field(first.get("description")))?;
+        return Some(RichCard::Article {
+            url: web_field(first.get("href")),
+            title,
+            desc: text_field(first.get("description")),
+            thumb: web_field(first.get("thumb")),
+        });
+    }
+    let object = parsed.as_object()?;
+    let action = object.get("action").and_then(Value::as_str).unwrap_or_default();
+    let params = json_field(object.get("params"));
+    match action {
+        "recommened.user" => {
+            let user_id = text_field(object.get("params")).filter(|id| id.bytes().all(|b| b.is_ascii_digit()))?;
+            let desc = json_field(object.get("description"));
+            return Some(RichCard::Contact {
+                user_id,
+                name: text_field(object.get("title")).unwrap_or_default(),
+                avatar: web_field(object.get("thumb")),
+                qr: desc.as_ref().and_then(|d| web_field(d.get("qrCodeUrl"))),
+            });
+        }
+        "recommened.calltime" | "recommened.misscall" => {
+            let params = params.unwrap_or_default();
+            let number = |key: &str| match params.get(key) {
+                Some(Value::Number(n)) => n.as_i64().unwrap_or(0),
+                Some(Value::String(s)) => s.parse().unwrap_or(0),
+                _ => 0,
+            };
+            return Some(RichCard::Call {
+                duration: number("duration").max(0),
+                video: number("calltype") == 1,
+                missed: action == "recommened.misscall",
+            });
+        }
+        _ => {}
+    }
+    let params = params?;
+    if let Some(preview) = params
+        .get("customMsg")
+        .and_then(|custom| custom.get("msg"))
+        .and_then(|msg| text_field(msg.get("vi")).or_else(|| text_field(msg.get("en"))))
+    {
+        return Some(RichCard::Text(preview));
+    }
+    let template = params.get("msg").and_then(|msg| text_field(msg.get("vi")).or_else(|| text_field(msg.get("en"))))?;
+    let mut names: Vec<String> = params
+        .get("highLightsV2")
+        .and_then(Value::as_array)
+        .map(|items| items.iter().filter_map(|item| text_field(item.get("dpn"))).collect())
+        .unwrap_or_default();
+    if names.is_empty() {
+        names.extend(text_field(params.get("dName")).or_else(|| text_field(object.get("title"))));
+    }
+    let question = text_field(params.get("question"));
+    if let Some(question) = &question {
+        names.push(question.clone());
+    }
+    let mut text = fill_template(&template, &names);
+    if let Some(question) = question.filter(|_| !template.contains("%2$s")) {
+        text = format!("{text}: “{question}”");
+    }
+    let text = text.trim().to_string();
+    (!text.is_empty()).then_some(RichCard::Notice(text))
+}
+
+/// Call log wording understood by the native call card and the egui client.
+pub fn call_text(duration: i64, video: bool, missed: bool, outgoing: bool) -> String {
+    let icon = if video { "📹" } else { "📞" };
+    let kind = if video { "Cuộc gọi video" } else { "Cuộc gọi" };
+    if missed || duration == 0 && !outgoing {
+        format!("{icon} {kind} nhỡ")
+    } else {
+        format!("{icon} {kind} {} ({duration}s)", if outgoing { "đi" } else { "đến" })
+    }
+}
+
 fn parse_chat_message(it: &Value) -> Option<ChatMessage> {
     let msg_type = normalize_msg_type(it);
 
@@ -5091,18 +5345,37 @@ fn parse_chat_message(it: &Value) -> Option<ChatMessage> {
     {
         sticker_meta = extract_sticker_info(it);
     }
-    let (link_url, mut link_title, link_desc, mut link_thumb, mut link_src) = raw_content_val
+    let (mut link_url, mut link_title, mut link_desc, mut link_thumb, mut link_src) = raw_content_val
         .map(extract_link_info)
         .unwrap_or((None, None, None, None, None));
 
     let mut content = raw_content_val
         .and_then(extract_content_text)
         .unwrap_or_default();
+    // Location messages carry `lat`/`lo` and a place title; keep the point as a map link
+    // so it survives storage. See re-notes/58_location_message.md.
+    if let Some((lat, lo, title)) = raw_content_val.and_then(location_point) {
+        link_url = Some(location_map_url(lat, lo));
+        link_src = Some(LOCATION_LINK_SRC.to_string());
+        link_thumb = None;
+        let label = title.filter(|t| !t.trim().is_empty());
+        if link_title.is_none() {
+            link_title = label.clone();
+        }
+        if content.trim().is_empty() || content.trim_start().starts_with('{') {
+            content = label.unwrap_or_else(|| "[Vị trí]".to_string());
+        }
+    }
 
+    // A link preview also has a thumbnail on Zalo's photo CDN; that alone is not a photo when the
+    // link itself points at an ordinary web page (re-notes/62_link_preview_not_photo.md).
+    let links_to_web_page = link_url
+        .as_deref()
+        .is_some_and(|url| !is_zalo_photo_cdn_url(url) && (url.starts_with("http://") || url.starts_with("https://")));
     let is_photo_msg = matches!(msg_type.as_str(), "chat.photo" | "photo" | "2")
         || link_src.as_deref() == Some("Hình ảnh Zalo")
         || link_url.as_deref().is_some_and(is_zalo_photo_cdn_url)
-        || link_thumb.as_deref().is_some_and(is_zalo_photo_cdn_url);
+        || (link_thumb.as_deref().is_some_and(is_zalo_photo_cdn_url) && !links_to_web_page);
     let is_file_msg = matches!(
         msg_type.as_str(),
         "chat.file" | "file" | "19" | "share.file"
@@ -5307,7 +5580,52 @@ fn parse_chat_message(it: &Value) -> Option<ChatMessage> {
             (None, None, None)
         };
 
+    let mut card = None;
+    match raw_content_val.and_then(rich_card) {
+        Some(RichCard::Contact { user_id, name, avatar, qr }) => {
+            content = format!("[Danh thiếp] {name}");
+            link_url = None;
+            link_title = Some(name.clone());
+            link_desc = None;
+            link_thumb = avatar.clone();
+            link_src = None;
+            sticker_meta = None;
+            card = Some(serde_json::json!({"kind":"contact","user_id":user_id,"name":name,"avatar":avatar,"qr":qr}));
+        }
+        Some(RichCard::Call { duration, video, missed }) => {
+            content = call_text(duration, video, missed, is_outgoing);
+            link_url = None;
+            link_title = None;
+            link_desc = None;
+            link_thumb = None;
+            link_src = None;
+            card = Some(serde_json::json!({"kind":"call","duration":duration,"video":video,"missed":missed}));
+        }
+        Some(RichCard::Notice(text)) => {
+            content = text;
+            link_url = None;
+            link_thumb = None;
+            link_src = None;
+            card = Some(serde_json::json!({"kind":"notice"}));
+        }
+        Some(RichCard::Text(text)) if link_url.is_none() => {
+            content = text;
+            link_thumb = None;
+            link_src = None;
+        }
+        Some(RichCard::Article { url, title, desc, thumb }) if link_url.is_none() => {
+            content = title.clone();
+            link_url = url;
+            link_title = Some(title);
+            link_desc = desc;
+            link_thumb = thumb;
+            link_src = None;
+        }
+        _ => {}
+    }
+
     Some(ChatMessage {
+        card,
         id: msg_id,
         client_message_id: ["cliMsgId", "clientId", "client_message_id"]
             .iter()
@@ -5438,6 +5756,16 @@ fn extract_message_thread_id_ext(
 
 /// Fold a `get-last-msgs` or `getChatFromPolling` response into thread previews and conversation messages.
 pub fn merge_previews(threads: &mut Vec<Thread>, resp: &Value) {
+    merge_preview_batch(threads, resp, false);
+}
+
+/// Merge a live push/poll batch, counting only newly inserted incoming messages as unread.
+/// History loads must continue to use `merge_previews`.
+pub fn merge_live_previews(threads: &mut Vec<Thread>, resp: &Value) {
+    merge_preview_batch(threads, resp, true);
+}
+
+fn merge_preview_batch(threads: &mut Vec<Thread>, resp: &Value, live: bool) {
     let mut entries: Vec<(&Value, bool)> = Vec::new();
     let parsed_str_data: Option<Value> = resp
         .get("data")
@@ -5451,6 +5779,9 @@ pub fn merge_previews(threads: &mut Vec<Thread>, resp: &Value) {
         .filter(|v| v.is_object() || v.is_array())
     {
         data_node = inner_data;
+    }
+    if live {
+        crate::unread::merge_read_points(threads, data_node);
     }
     let cloud_tid: Option<String> = threads
         .iter()
@@ -5599,6 +5930,9 @@ pub fn merge_previews(threads: &mut Vec<Thread>, resp: &Value) {
                     existing.is_starred = existing.is_starred || parsed.is_starred;
                     identities.insert(existing, row);
                 } else {
+                    if live {
+                        t.unread.observe_live(&parsed);
+                    }
                     identities.insert(&parsed, t.messages.len());
                     t.messages.push(parsed);
                 }
@@ -5612,9 +5946,13 @@ pub fn merge_previews(threads: &mut Vec<Thread>, resp: &Value) {
                 let mut identities = MessageIdentityIndex::default();
                 identities.insert(&parsed, 0);
                 message_indices.push(identities);
+                let mut unread = crate::unread::UnreadState::default();
+                if live {
+                    unread.observe_live(&parsed);
+                }
                 threads.push(Thread {
                     presentation: Default::default(),
-                    unread: Default::default(),
+                    unread,
                     id: tid,
                     name: default_name,
                     preview: parsed.text.clone(),
@@ -5625,6 +5963,11 @@ pub fn merge_previews(threads: &mut Vec<Thread>, resp: &Value) {
                 });
             }
         }
+    }
+
+    if live {
+        // A previously unknown conversation may carry its read point in the same batch.
+        crate::unread::merge_read_points(threads, data_node);
     }
 
     for t in threads.iter_mut() {
@@ -6279,7 +6622,8 @@ pub async fn set_unread_mark(
 
 /// Mute or unmute notifications for a conversation (`setMuteConversation` @ `compact-app-pc.js:14304409`, cmd `11288`).
 /// `duration_sec`: `3600` (1h), `14400` (4h), seconds until 8:00 AM, or `-1` (until reopened).
-/// `mute`: `true` -> `action = 1`, `false` -> `action = 2`.
+/// `mute`: `true` -> `action = 1` (`SET_MUTE`), `false` -> `action = 3` (`UNSET_MUTE`); Zalo
+/// answers error 114 to `action = 2` (re-notes/68_mute_phone_search.md).
 pub async fn set_mute_conversation(
     s: &Session,
     thread_id: &str,
@@ -6298,7 +6642,7 @@ pub async fn set_mute_conversation(
     let body = json!({
         "toid": clean,
         "duration": duration_sec,
-        "action": if mute { 1 } else { 2 },
+        "action": if mute { 1 } else { 3 },
         "startTime": crate::login::unix_now(),
         "muteType": if is_group { 2 } else { 1 },
         "imei": s.imei
@@ -7028,6 +7372,43 @@ mod tests {
     }
 
     #[test]
+    fn merge_live_previews_counts_new_incoming_once_and_never_history_or_sent_echoes() {
+        let batch = json!({"data":[{"idTo":"u1","messages":[
+            {"msgId":"101","content":"Incoming","ts":1729501000000_i64,"uidFrom":"u1"},
+            {"msgId":"102","content":"Sent","ts":1729501000001_i64,"uidFrom":"0"}
+        ]}]});
+        let mut threads = vec![sample_thread("u1")];
+        merge_live_previews(&mut threads, &batch);
+        assert_eq!(threads[0].unread.count(), 1);
+        assert!(threads[0].unread.unread_ids.contains("101"));
+        merge_live_previews(&mut threads, &batch);
+        assert_eq!(threads[0].unread.count(), 1); // (INV-4)
+        let mut history = vec![sample_thread("u1")];
+        merge_previews(&mut history, &batch);
+        assert_eq!(history[0].unread.count(), 0);
+        merge_live_previews(&mut history, &batch);
+        assert_eq!(history[0].unread.count(), 0);
+    }
+
+    #[test]
+    fn merge_live_previews_respects_read_points_and_new_conversations() {
+        let mut threads = Vec::new();
+        let batch = json!({"data":{"clearUnreads":[{"idTo":"u1","lastMsgId":"100"}],
+            "msgs":[{"idTo":"u1","messages":[
+                {"msgId":"99","content":"Read","ts":1729501000000_i64,"uidFrom":"u1"},
+                {"msgId":"101","content":"Unread","ts":1729501000001_i64,"uidFrom":"u1"}
+            ]}]}});
+        merge_live_previews(&mut threads, &batch);
+        assert_eq!(threads.len(), 1);
+        assert_eq!(threads[0].unread.count(), 1);
+        assert_eq!(threads[0].unread.last_seen_id.as_deref(), Some("100"));
+        merge_live_previews(&mut threads, &json!({"data":{"clearUnreads":[{"idTo":"u1","lastMsgId":"101"}]}}));
+        assert_eq!(threads[0].unread.count(), 0);
+        merge_live_previews(&mut threads, &batch);
+        assert_eq!(threads[0].unread.count(), 0);
+    }
+
+    #[test]
     fn test_merge_previews_single_message_object() {
         let mut threads = vec![sample_thread("u1")];
         let resp = json!({
@@ -7665,6 +8046,30 @@ mod send_identity_tests {
     use super::*;
 
     #[test]
+    fn sticker_art_keeps_only_animated_https_sprites() {
+        let rows = vec![
+            json!({"id": 10, "stickerSpriteUrl": "https://example.invalid/s.png", "totalFrames": 12, "duration": 1200}),
+            json!({"id": 11, "stickerSpriteUrl": "https://example.invalid/t.png", "totalFrames": 1, "duration": 0}),
+            json!({"id": 12, "stickerSpriteUrl": "file:///etc/passwd", "totalFrames": 8, "duration": 800}),
+            json!({"stickerSpriteUrl": "https://example.invalid/u.png", "totalFrames": 8}),
+        ];
+        let art = parse_sticker_art(&rows);
+        assert_eq!(art.len(), 1);
+        assert_eq!(art[&10], StickerArt { sprite_url: "https://example.invalid/s.png".into(), total_frames: 12, duration_ms: 1200 });
+    }
+
+    #[test]
+        fn location_points_parse_direct_and_nested_shapes() {
+        let direct = json!({"lat": 20.98, "lo": "105.86", "title": "Quán cà phê"});
+        assert_eq!(location_point(&direct), Some((20.98, 105.86, Some("Quán cà phê".into()))));
+        let nested = json!({"title": "Nhà", "params": "{\"latitude\":10.5,\"longitude\":106.7}"});
+        assert_eq!(location_point(&nested), Some((10.5, 106.7, Some("Nhà".into()))));
+        assert_eq!(location_point(&json!({"lat": 0, "lo": 0})), None);
+        assert_eq!(location_point(&json!({"lat": 200, "lo": 10})), None);
+        assert_eq!(location_map_url(20.98, 105.86), "https://maps.google.com/maps?q=20.980000,105.860000&z=15");
+    }
+
+    #[test]
     fn request_ids_are_unique_when_sends_share_a_clock_tick() {
         let ids: Vec<_> = (0..10_000).map(|_| next_client_message_id()).collect();
         assert!(ids.windows(2).all(|ids| ids[0] < ids[1]));
@@ -7940,6 +8345,22 @@ mod send_identity_tests {
     }
 
     #[test]
+    fn link_preview_with_cdn_thumbnail_stays_a_link() {
+        let raw = json!({
+            "msgId": "link_1", "msgType": "chat.recommended", "uidFrom": "1000001", "ts": 1700000000000_i64,
+            "content": {
+                "title": "https://shop.example/dau-noi",
+                "description": "Đầu nối nhanh",
+                "href": "https://shop.example/dau-noi",
+                "thumb": "https://photo-stal-31.zdn.vn/no/4e4e33f4efd8388661c9/2HGb6F.jpg"
+            }
+        });
+        let msg = parse_chat_message(&raw).expect("must parse link message");
+        assert_ne!(msg.link_src.as_deref(), Some("Hình ảnh Zalo"));
+        assert_eq!(msg.link_url.as_deref(), Some("https://shop.example/dau-noi"));
+    }
+
+    #[test]
     fn parse_photo_message_hides_raw_cdn_url_and_sets_photo_source() {
         let raw_photo = json!({
             "msgId": "photo_72",
@@ -8054,5 +8475,48 @@ mod send_identity_tests {
                 checksum: "md5_123".into(),
             }
         );
+    }
+}
+
+#[cfg(test)]
+mod rich_card_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn contact_card_reads_id_name_avatar_and_qr() {
+        let content = json!({"action":"recommened.user","title":"Example","thumb":"https://s1.example/a.jpg",
+            "params":"1000001","href":"https://zalo.me/x","description":"{\"qrCodeUrl\":\"https://qr.example/q.jpg\"}"});
+        assert_eq!(rich_card(&content), Some(RichCard::Contact { user_id: "1000001".into(), name: "Example".into(),
+            avatar: Some("https://s1.example/a.jpg".into()), qr: Some("https://qr.example/q.jpg".into()) }));
+        let message = parse_chat_message(&json!({"msgId":"1","uidFrom":"7","ts":1,"msgType":"chat.recommended","content":content})).unwrap();
+        assert_eq!(message.text, "[Danh thiếp] Example");
+        assert_eq!(message.card.unwrap()["kind"], "contact");
+        assert!(message.link_url.is_none());
+    }
+
+    #[test]
+    fn call_card_keeps_duration_and_direction() {
+        let content = json!({"action":"recommened.calltime","description":"Cuộc gọi","title":"sendBubbleMessage",
+            "params":"{\"calltype\":0,\"duration\":91,\"reason\":0}"});
+        let message = parse_chat_message(&json!({"msgId":"1","uidFrom":"0","ts":1,"msgType":"chat.recommended","content":content})).unwrap();
+        assert_eq!(message.text, "📞 Cuộc gọi đi (91s)");
+        let missed = json!({"action":"recommened.misscall","params":"{\"calltype\":1,\"duration\":0}"});
+        assert_eq!(rich_card(&missed), Some(RichCard::Call { duration: 0, video: true, missed: true }));
+        assert_eq!(call_text(0, true, true, false), "📹 Cuộc gọi video nhỡ");
+    }
+
+    #[test]
+    fn notices_templates_and_lists_get_readable_text() {
+        let pin = json!({"action":"msginfo.actionlist","title":"A","params":"{\"msg\":{\"vi\":\"%1$s đã ghim một tin nhắn\"},\"highLightsV2\":[{\"dpn\":\"An\"}]}"});
+        assert_eq!(rich_card(&pin), Some(RichCard::Notice("An đã ghim một tin nhắn".into())));
+        let vote = json!({"action":"vote","params":"{\"msg\":{\"vi\":\"%1$s tham gia bình chọn\"},\"dName\":\"Bình\",\"question\":\"Đi đâu?\"}"});
+        assert_eq!(rich_card(&vote), Some(RichCard::Notice("Bình tham gia bình chọn: “Đi đâu?”".into())));
+        let oa = json!({"action":"","params":"{\"customMsg\":{\"msg\":{\"vi\":\"Ưu đãi tháng 11\"}}}"});
+        assert_eq!(rich_card(&oa), Some(RichCard::Text("Ưu đãi tháng 11".into())));
+        let list = json!([{"title":"Bài viết","description":"Tóm tắt","href":"https://example.com/a","thumb":"https://example.com/t.jpg"}]);
+        let message = parse_chat_message(&json!({"msgId":"1","uidFrom":"7","ts":1,"msgType":"chat.list","content":list})).unwrap();
+        assert_eq!(message.text, "Bài viết");
+        assert_eq!(message.link_url.as_deref(), Some("https://example.com/a"));
     }
 }

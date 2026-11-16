@@ -133,6 +133,20 @@ impl UnreadState {
             }
         }
     }
+    /// Count a newly inserted live message even before the server supplies a read cursor.
+    /// Callers must deduplicate the live batch and must never pass history pages here.
+    pub fn observe_live(&mut self, message: &ChatMessage) {
+        if !message.is_outgoing
+            && message.kind != crate::message_model::MessageKind::System
+            && message.unread_policy.counts_unread()
+            && numeric_id(&message.id).is_some()
+            && self.last_seen_id.as_deref().is_none_or(|point| {
+                compare_ids(&message.id, point).is_some_and(|order| order.is_gt())
+            })
+        {
+            self.unread_ids.insert(message.id.clone());
+        }
+    }
     pub fn observe_for_account(&mut self, messages: &[ChatMessage], account: &str) {
         self.observe(messages);
         self.observe_mentions(messages, account);

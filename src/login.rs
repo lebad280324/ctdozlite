@@ -268,6 +268,8 @@ pub fn apply_login_config(s: &mut Session, cfg: &Value) {
         .and_then(as_str)
         .unwrap_or_default();
 
+    // Kept separately from `uin`: the profile's numeric id later replaces `uin`.
+    let data_key = cfg.get("dkey").and_then(as_str).unwrap_or_default();
     let new_enk = cfg.get("zpw_enk").and_then(as_str).unwrap_or_default();
     let new_send2me_id = cfg.get("send2me_id").and_then(as_str).unwrap_or_default();
 
@@ -295,6 +297,7 @@ pub fn apply_login_config(s: &mut Session, cfg: &Value) {
 
     let mut current = s.login.take().unwrap_or_default();
     if !new_dkey.is_empty() { current.uin = new_dkey.to_string(); }
+    if !data_key.is_empty() { current.dkey = data_key.to_string(); }
     if !new_enk.is_empty() { current.zpw_enk = new_enk.to_string(); }
     if !new_sek.is_empty() { current.zpw_sek = new_sek.to_string(); }
     else if current.zpw_sek.is_empty() {

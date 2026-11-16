@@ -2168,6 +2168,42 @@ enum CallEngineCmd {
 
 pub struct CallBridge {
     cmd_tx: mpsc::UnboundedSender<CallEngineCmd>,
+    task_owner: Arc<CallTaskOwner>,
+}
+
+#[derive(Default)]
+struct CallTaskOwner {
+    stopped: std::sync::atomic::AtomicBool,
+    tasks: std::sync::Mutex<Vec<tokio::task::AbortHandle>>,
+}
+
+impl CallTaskOwner {
+    fn stop(&self) {
+        self.stopped.store(true, std::sync::atomic::Ordering::Release);
+        if let Ok(mut tasks) = self.tasks.lock() {
+            for task in tasks.drain(..) { task.abort(); }
+        }
+    }
+}
+
+fn spawn_owned_call(
+    owner: Arc<CallTaskOwner>,
+    operation: impl std::future::Future<Output = ()> + Send + 'static,
+) -> tokio::task::JoinHandle<()> {
+    let check = owner.clone();
+    let task = tokio::spawn(async move {
+        if !check.stopped.load(std::sync::atomic::Ordering::Acquire) { operation.await; }
+    });
+    if let Ok(mut tasks) = owner.tasks.lock() {
+        tasks.retain(|task| !task.is_finished());
+        if owner.stopped.load(std::sync::atomic::Ordering::Acquire) { task.abort(); }
+        else { tasks.push(task.abort_handle()); }
+    } else { task.abort(); }
+    task
+}
+
+impl Drop for CallBridge {
+    fn drop(&mut self) { self.task_owner.stop(); }
 }
 
 impl CallBridge {
@@ -2180,8 +2216,9 @@ impl CallBridge {
         let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<CallEngineCmd>();
         let active_call: Arc<Mutex<Option<PureRustCallState>>> = Arc::new(Mutex::new(None));
         let cmd_tx_inner = cmd_tx.clone();
+        let task_owner = Arc::new(CallTaskOwner::default());
 
-        tokio::spawn(async move {
+        spawn_owned_call(task_owner.clone(), { let task_owner = task_owner.clone(); async move { let _ = &task_owner;
             while let Some(cmd) = cmd_rx.recv().await {
                 match cmd {
                     CallEngineCmd::MakeCall {
@@ -2230,7 +2267,7 @@ impl CallBridge {
                         let ctx_clone = egui_ctx.clone();
                         let active_clone = active_call.clone();
 
-                        tokio::spawn(async move {
+                        spawn_owned_call(task_owner.clone(), { let task_owner = task_owner.clone(); async move { let _ = &task_owner;
                             let mut group_candidates: Vec<String> = Vec::new();
                             if is_group {
                                 let clean_gid = partner_id
@@ -2884,7 +2921,7 @@ impl CallBridge {
                             };
                             let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(status_txt));
                             ctx_clone.request_repaint();
-                        });
+                        } });
                     }
 
                     CallEngineCmd::AnswerCall { accept, cam_start_off } => {
@@ -2892,7 +2929,7 @@ impl CallBridge {
                         let active_clone = active_call.clone();
                         let gui_tx_clone = gui_tx.clone();
                         let ctx_clone = egui_ctx.clone();
-                        tokio::spawn(async move {
+                        spawn_owned_call(task_owner.clone(), { let task_owner = task_owner.clone(); async move { let _ = &task_owner;
                             if accept {
                                 // Wait up to 350ms if the incoming ZRTP UDP probe is still finishing
                                 for _ in 0..14 {
@@ -3000,10 +3037,27 @@ impl CallBridge {
                                 }
                                 match dispatch_send_signal(&s_snap, 402, &req_402).await {
                                     Ok(r) => eprintln!("[call] 402 answer resp: {}", r),
-                                    Err(e) => eprintln!("[call] 402 answer err: {e}"),
+                                    Err(e) => {
+                                        eprintln!("[call] 402 answer err: {e}");
+                                        // `voicecall error -101` was seen when the call had already been
+                                        // answered on the phone (call_trace 2026-11-12, re-note 60). The call
+                                        // is gone server-side, so do not leave a dead "connected" call here.
+                                        if accept && e.to_string().contains("-101") {
+                                            let mut guard = active_clone.lock().await;
+                                            if guard.as_ref().is_some_and(|st| st.call_id == call_id) {
+                                                *guard = None;
+                                                let _ = gui_tx_clone.send(GuiEvent::CallStateChanged(
+                                                    "answered_elsewhere".into(),
+                                                ));
+                                                let _ = gui_tx_clone
+                                                    .send(GuiEvent::CallStateChanged("free".into()));
+                                                ctx_clone.request_repaint();
+                                            }
+                                        }
+                                    }
                                 }
                             }
-                        });
+                        } });
                     }
 
                     CallEngineCmd::SetMediaState {
@@ -3045,7 +3099,7 @@ impl CallBridge {
                             for leg in &st.extra_legs {
                                 targets.push((leg.partner_id.clone(), leg.call_id));
                             }
-                            tokio::spawn(async move {
+                            spawn_owned_call(task_owner.clone(), { let task_owner = task_owner.clone(); async move { let _ = &task_owner;
                                 for (pid, cid) in targets {
                                     let req_12006 = json!({
                                         "calleeId": pid,
@@ -3056,7 +3110,7 @@ impl CallBridge {
                                     });
                                     let _ = dispatch_send_signal(&s_snap, 12006, &req_12006).await;
                                 }
-                            });
+                            } });
                         }
                     }
 
@@ -3113,7 +3167,7 @@ impl CallBridge {
                             let _ = gui_tx.send(GuiEvent::CallStateChanged("free".into()));
                             egui_ctx.request_repaint();
 
-                            tokio::spawn(async move {
+                            spawn_owned_call(task_owner.clone(), { let task_owner = task_owner.clone(); async move { let _ = &task_owner;
                                 if is_group {
                                     let clean_gid = thread_id
                                         .trim_start_matches("group_")
@@ -3193,7 +3247,7 @@ impl CallBridge {
                                         let _ = dispatch_send_signal(&s_snap, 405, &r405).await;
                                     }
                                 }
-                            });
+                            } });
                         }
                     }
 
@@ -3323,6 +3377,37 @@ impl CallBridge {
                                 if !is_primary_leg && extra_leg_idx.is_none() {
                                     continue;
                                 }
+                                // Ringing here and the callee's `answer` carries our own UIN: this
+                                // account picked the call up on another device. A local accept sets
+                                // `is_connected` first, so its echo never reaches this branch.
+                                if is_primary_leg && !st_check.is_caller && !st_check.is_connected {
+                                    let self_uin = s_snap
+                                        .login
+                                        .as_ref()
+                                        .map(|l| l.uin.clone())
+                                        .unwrap_or_default();
+                                    let uid_n = data
+                                        .get("uidN")
+                                        .and_then(|v| match v {
+                                            Value::String(s) => Some(s.clone()),
+                                            Value::Number(n) => Some(n.to_string()),
+                                            _ => None,
+                                        })
+                                        .unwrap_or_default();
+                                    if !self_uin.is_empty() && uid_n == self_uin {
+                                        *guard = None;
+                                        drop(guard);
+                                        let _ = gui_tx.send(GuiEvent::CallStateChanged(
+                                            "answered_elsewhere".into(),
+                                        ));
+                                        let _ = gui_tx.send(GuiEvent::CallStateChanged("free".into()));
+                                        let _ = gui_tx.send(GuiEvent::StatusUpdate(
+                                            "Cuộc gọi đã được trả lời trên thiết bị khác".into(),
+                                        ));
+                                        egui_ctx.request_repaint();
+                                        continue;
+                                    }
+                                }
                                 if is_primary_leg && st_check.is_connected {
                                     if st_check.is_group {
                                         let ans_status = data
@@ -3443,7 +3528,7 @@ impl CallBridge {
                                                 let l_cid = leg.call_id;
                                                 let l_pid = leg.partner_id.clone();
                                                 let s_cl = s_snap.clone();
-                                                tokio::spawn(async move {
+                                                spawn_owned_call(task_owner.clone(), { let task_owner = task_owner.clone(); async move { let _ = &task_owner;
                                                     let req_408 = json!({
                                                         "calleeId": l_pid,
                                                         "callId": l_cid
@@ -3451,7 +3536,7 @@ impl CallBridge {
                                                     let _ =
                                                         dispatch_send_signal(&s_cl, 408, &req_408)
                                                             .await;
-                                                });
+                                                } });
                                                 egui_ctx.request_repaint();
                                                 continue;
                                             }
@@ -3571,7 +3656,7 @@ impl CallBridge {
                                         let call_id = st.call_id;
                                         let callee_id = st.partner_id.clone();
                                         if !is_group_call {
-                                            tokio::spawn(async move {
+                                            spawn_owned_call(task_owner.clone(), { let task_owner = task_owner.clone(); async move { let _ = &task_owner;
                                                 let req_408 = json!({
                                                     "calleeId": callee_id,
                                                     "callId": call_id
@@ -3579,7 +3664,7 @@ impl CallBridge {
                                                 let _ =
                                                     dispatch_send_signal(&s_snap, 408, &req_408)
                                                         .await;
-                                            });
+                                            } });
                                         }
                                     }
                                     let _ =
@@ -4002,7 +4087,7 @@ impl CallBridge {
                                     ctx_clone.request_repaint();
                                 }
 
-                                tokio::spawn(async move {
+                                spawn_owned_call(task_owner.clone(), { let task_owner = task_owner.clone(); async move { let _ = &task_owner;
                                     if !is_upgrade {
                                         // Notify caller that our client is ringing (`407`) right away
                                         let req_407 = json!({
@@ -4074,16 +4159,16 @@ impl CallBridge {
                                             st.keepalive_abort = keepalive_abort;
                                         }
                                     }
-                                });
+                                } });
                             }
                             _ => {}
                         }
                     }
                 }
             }
-        });
+        } });
 
-        Self { cmd_tx }
+        Self { cmd_tx, task_owner }
     }
 
     /// Initiate an outgoing voice or video call (1-on-1 or Group) 100% in pure Rust.
@@ -4102,6 +4187,9 @@ impl CallBridge {
             is_group,
         });
     }
+
+    /// Whether the owning call command loop is still available.
+    pub fn is_running(&self) -> bool { !self.cmd_tx.is_closed() }
 
     /// Accept (`true`) or decline (`false`) an incoming VoIP call.
     pub fn answer_call(&self, accept: bool, cam_start_off: bool) {
@@ -4133,6 +4221,33 @@ impl CallBridge {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn call_owner_cancels_inflight_child_tasks() {
+        let owner = Arc::new(CallTaskOwner::default());
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let task = spawn_owned_call(owner.clone(), async move {
+            let _ = started.send(());
+            std::future::pending::<()>().await;
+        });
+        ready.await.unwrap();
+        owner.stop();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), task).await.unwrap();
+        assert!(result.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn stopped_call_owner_cannot_start_another_operation() {
+        let owner = Arc::new(CallTaskOwner::default());
+        owner.stop();
+        let touched = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let inside = touched.clone();
+        let task = spawn_owned_call(owner, async move {
+            inside.store(true, std::sync::atomic::Ordering::Release);
+        });
+        let _ = task.await;
+        assert!(!touched.load(std::sync::atomic::Ordering::Acquire));
+    }
 
     #[test]
     fn outbound_call_lock_allows_only_test_accounts() {

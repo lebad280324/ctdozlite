@@ -402,7 +402,10 @@ pub fn spawn(sess: Session) -> mpsc::UnboundedReceiver<WsEvent> {
         let mut backoff = 2u64;
         let mut endpoint_idx = 0usize;
         loop {
-            match run_once(&sess, &tx, endpoint_idx).await {
+            let Some(result) = until_owner_closes(&tx, run_once(&sess, &tx, endpoint_idx)).await else {
+                break;
+            };
+            match result {
                 Ok(reason) => trace(format!("closed: {reason}")),
                 Err(e) => trace(format!("error: {e:#}")),
             }
@@ -411,11 +414,29 @@ pub fn spawn(sess: Session) -> mpsc::UnboundedReceiver<WsEvent> {
             }
             // `3002 NOT_FOUND_WORKER` means this shard does not host the session; rotate.
             endpoint_idx = endpoint_idx.wrapping_add(1);
-            tokio::time::sleep(Duration::from_secs(backoff)).await;
+            if until_owner_closes(&tx, tokio::time::sleep(Duration::from_secs(backoff)))
+                .await
+                .is_none()
+            {
+                break;
+            }
             backoff = (backoff * 2).min(30);
         }
     });
     rx
+}
+
+// Ownership must cancel even a pending handshake, read, write or reconnect delay;
+// checking only after run_once returns can retain a logged-out session forever.
+async fn until_owner_closes<T>(
+    sender: &mpsc::UnboundedSender<WsEvent>,
+    work: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    tokio::select! {
+        biased;
+        _ = sender.closed() => None,
+        result = work => Some(result),
+    }
 }
 
 async fn run_once(
@@ -602,6 +623,28 @@ async fn run_once(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn receiver_drop_cancels_an_inflight_connection_operation() {
+        let (sender, receiver) = mpsc::unbounded_channel::<WsEvent>();
+        let operation = tokio::spawn(async move {
+            until_owner_closes(&sender, std::future::pending::<()>()).await
+        });
+        tokio::task::yield_now().await;
+        drop(receiver);
+        assert!(tokio::time::timeout(Duration::from_secs(1), operation)
+            .await.unwrap().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn closed_owner_cannot_start_a_new_connection_attempt() {
+        let (sender, receiver) = mpsc::unbounded_channel::<WsEvent>();
+        drop(receiver);
+        let started = std::cell::Cell::new(false);
+        let result = until_owner_closes(&sender, async { started.set(true); }).await;
+        assert!(result.is_none());
+        assert!(!started.get());
+    }
 
     #[test]
     fn frame_roundtrip() {

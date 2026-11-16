@@ -246,7 +246,7 @@ pub async fn confirm(s: &Session, q: &QrLogin) -> Result<Value> {
         bail!("reqqr: không có chk_wait_cfirm");
     }
     let deadline = std::time::Instant::now() + Duration::from_secs(q.qr_timeout.max(60));
-    println!("Đã quét mã QR! Vui lòng bấm 'Đăng nhập' trên điện thoại…");
+    eprintln!("Đã quét mã QR! Vui lòng bấm 'Đăng nhập' trên điện thoại…");
 
     loop {
         if std::time::Instant::now() >= deadline {

@@ -2087,21 +2087,7 @@ impl ZaloGuiApp {
                                                 ui.add_space(16.0);
                                             }
 
-                                            ui.label(RichText::new("Hình nền chat").color(pal.text_primary).size(13.5).strong());
-                                            ui.add_space(6.0);
-                                            egui::Frame::none()
-                                                .fill(pal.bg_elevated)
-                                                .stroke(Stroke::new(1.0_f32, pal.border))
-                                                .rounding(Rounding::same(8.0))
-                                                .inner_margin(Margin::symmetric(14.0, 10.0))
-                                                .show(ui, |ui| {
-                                                    ui.horizontal(|ui| {
-                                                        ui.label(RichText::new("Sử dụng Avatar làm hình nền").color(pal.text_primary).size(13.2));
-                                                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                                            render_toggle_switch(ui, &mut self.settings.use_avatar_as_wallpaper, pal);
-                                                        });
-                                                    });
-                                                });
+                                            self.render_chat_appearance_settings(ui, pal);
                                             ui.add_space(16.0);
                                             ui.label(RichText::new("Theme & Sticker Pack tùy chỉnh (Plugin JSON)").color(pal.text_primary).size(13.5).strong());
                                             ui.add_space(6.0);
@@ -2966,9 +2952,9 @@ impl ZaloGuiApp {
             self.theme_dirty = true;
             self.settings.save();
             self.show_toast(if self.dark_mode {
-                "Đã chuyển sang giao diện Tối (Atom One Dark)"
+                "Đã chuyển sang giao diện tối"
             } else {
-                "Đã chuyển sang giao diện Sáng (Zalo Light)"
+                "Đã chuyển sang giao diện sáng"
             });
         }
         if trigger_sync {

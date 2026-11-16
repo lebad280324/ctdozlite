@@ -174,6 +174,29 @@ pub mod packet {
 // Mở rộng các phương thức mạng xã hội cho Session
 impl crate::session::Session {
     /// Lấy hồ sơ chi tiết bạn bè (Ảnh bìa Cover HD, Avatar, Ngày sinh, Giới tính, Bio)
+    /// Raw profile object from the same `getprofiles` request, for fields the typed model omits.
+    pub async fn get_friend_social_profile_value(&self, target_uid: &str) -> Result<Value> {
+        let body = json!({
+            "avatar_size": 240,
+            "friend_ids": [target_uid],
+            "imei": self.imei,
+        });
+        let enc = self.encoded_params(&body)?;
+        let url = format!(
+            "{}/api/social/friend/getprofiles?{}&params={enc}&os=8",
+            self.domains.profile,
+            self.common_params()
+        );
+        let resp = self.get(&url).await?;
+        let dec = self.maybe_decrypt(resp, self.session_key_bytes()).await;
+        if dec.get("error_code").and_then(Value::as_i64) == Some(0) {
+            if let Some(profile) = dec.get("data").and_then(|d| d.get(target_uid)) {
+                return Ok(profile.clone());
+            }
+        }
+        Err(anyhow!("profile unavailable for {target_uid}"))
+    }
+
     pub async fn get_friend_social_profile(&self, target_uid: &str) -> Result<SocialUserProfile> {
         let body = json!({
             "avatar_size": 240,

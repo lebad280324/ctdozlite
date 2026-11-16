@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key><string>vi</string>
+    <key>CFBundleDisplayName</key><string>Zalolite</string>
+    <key>CFBundleExecutable</key><string>CTDoNative</string>
+    <key>CFBundleIconFile</key><string>AppIcon</string>
+    <key>CFBundleIdentifier</key><string>com.ctdoteam1110.ctdozlite.native</string>
+    <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+    <key>CFBundleName</key><string>Zalolite</string>
+    <key>CFBundlePackageType</key><string>APPL</string>
+    <key>CFBundleShortVersionString</key><string>0.0.0</string>
+    <key>CFBundleVersion</key><string>0</string>
+    <key>LSMinimumSystemVersion</key><string>14.0</string>
+    <key>NSHighResolutionCapable</key><true/>
+    <key>NSPrincipalClass</key><string>NSApplication</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Zalolite cần quyền truy cập micrô khi bạn thực hiện cuộc gọi Zalo.</string>
+    <key>NSCameraUsageDescription</key>
+    <string>Zalolite cần quyền truy cập camera khi bạn thực hiện cuộc gọi video Zalo.</string>
+</dict>
+</plist>

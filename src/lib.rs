@@ -20,6 +20,7 @@ pub mod reactions;
 pub mod session;
 pub mod socket;
 pub mod store;
+pub mod zalo_backup;
 pub mod tui;
 pub mod ui;
 pub mod unread;
@@ -38,3 +39,6 @@ pub mod api_mcp;
 
 /// Native notification authorization without delivery.
 pub mod native_notifications;
+
+/// UI-independent worker and JSON-lines bridge for the native macOS application.
+pub mod native_core;

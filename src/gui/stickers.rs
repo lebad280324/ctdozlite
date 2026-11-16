@@ -914,9 +914,8 @@ impl ZaloGuiApp {
             }
         }
 
-        egui::Frame::none()
-            .fill(pal.bg_sidebar)
-            .stroke(Stroke::new(1.0_f32, pal.border))
+        floating_surface(pal, 24.0)
+            .outer_margin(Margin::symmetric(14.0, 4.0))
             .inner_margin(Margin::symmetric(14.0, 8.0))
             .show(ui, |ui| {
                 ui.set_height(248.0);

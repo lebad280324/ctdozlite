@@ -1,6 +1,6 @@
 [package]
 name = "ctdozlite"
-version = "0.0.8"
+version = "0.0.10"
 edition = "2021"
 authors = ["TIPC1110 <tienichpc1110@gmail.com>"]
 description = "Lightweight, high-performance native Zalo PC client written in Rust (zero Node.js, zero Electron)"
@@ -71,6 +71,10 @@ path = "src/bin/call_probe.rs"
 [[bin]]
 name = "view_feed"
 path = "src/bin/view_feed.rs"
+
+[[bin]]
+name = "ctdozlite-core"
+path = "src/bin/ctdozlite_core.rs"
 
 [package.metadata.deb]
 name = "ctdozlite"

@@ -6,6 +6,15 @@ pub(super) static KNOWN_THREADS: std::sync::Mutex<Vec<(String, String, bool)>> =
     std::sync::Mutex::new(Vec::new());
 
 pub enum WorkerCmd {
+    /// Restore local appearance preferences without blocking the UI.
+    LoadChatAppearance,
+    /// Persist the latest debounced appearance snapshot.
+    SaveChatAppearance(ChatAppearance),
+    /// Decode an existing local path, or open the native picker when no path is provided.
+    LoadChatWallpaper {
+        request_id: u64,
+        path: Option<String>,
+    },
     /// Read OS authorization without prompting.
     ReadNotificationAuthorization {
         request_id: u64,
@@ -754,6 +763,31 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
 
                 while let Some(cmd) = cmd_rx.recv().await {
                     match cmd {
+                        WorkerCmd::LoadChatAppearance => {
+                            let result = tokio::task::spawn_blocking(load_chat_appearance).await
+                                .unwrap_or_else(|_| Err("Không thể tải cài đặt nền chat.".into()));
+                            // Closing the GUI receiver is normal during shutdown.
+                            let _ = gui_tx.send(GuiEvent::ChatAppearanceLoaded(result));
+                        }
+                        WorkerCmd::SaveChatAppearance(appearance) => {
+                            // Await each small write so newer snapshots cannot be overwritten by older ones.
+                            let result = tokio::task::spawn_blocking(move || save_chat_appearance(&appearance)).await
+                                .unwrap_or_else(|_| Err("Không thể lưu cài đặt nền chat.".into()));
+                            // Closing the GUI receiver is normal during shutdown.
+                            let _ = gui_tx.send(GuiEvent::ChatAppearanceSaved(result));
+                        }
+                        WorkerCmd::LoadChatWallpaper { request_id, path } => {
+                            let tx = gui_tx.clone();
+                            tokio::spawn(async move {
+                                let result = tokio::task::spawn_blocking(move || {
+                                    let path = path.or_else(|| pick_native_file_dialog(true)
+                                        .map(|p| p.to_string_lossy().into_owned()));
+                                    path.map(load_chat_wallpaper).transpose()
+                                }).await.unwrap_or_else(|_| Err("Không thể mở ảnh nền.".into()));
+                                // Closing the GUI receiver is normal during shutdown.
+                                let _ = tx.send(GuiEvent::ChatWallpaperLoaded { request_id, result });
+                            });
+                        }
                         WorkerCmd::ReadNotificationAuthorization { request_id }
                         | WorkerCmd::RequestNotificationAuthorization { request_id } => {
                             let request = matches!(

@@ -373,7 +373,7 @@ pub(super) fn pick_native_file_dialog(images_only: bool) -> Option<std::path::Pa
             "All Files (*.*)\0*.*\0Video & Media (*.mp4;*.mov;*.mkv;*.mp3;*.wav)\0*.mp4;*.mov;*.mkv;*.mp3;*.wav\0Documents (*.pdf;*.zip;*.docx;*.xlsx;*.txt)\0*.pdf;*.zip;*.docx;*.xlsx;*.txt\0\0"
         };
         let title_raw = if images_only {
-            "Chọn hình ảnh để gửi qua Zalo\0"
+            "Chọn hình ảnh\0"
         } else {
             "Chọn video hoặc tập tin đính kèm để gửi qua Zalo\0"
         };
@@ -425,7 +425,7 @@ pub(super) fn pick_native_file_dialog(images_only: bool) -> Option<std::path::Pa
     #[cfg(target_os = "macos")]
     {
         let prompt = if images_only {
-            "POSIX path of (choose file with prompt \"Chọn hình ảnh để gửi qua Zalo\" of type {\"public.image\"})"
+            "POSIX path of (choose file with prompt \"Chọn hình ảnh\" of type {\"public.image\"})"
         } else {
             "POSIX path of (choose file with prompt \"Chọn tập tin đính kèm để gửi qua Zalo\")"
         };
@@ -2046,12 +2046,13 @@ pub(super) fn render_chat_bubble(
                         Color32::from_rgb(34, 197, 94).linear_multiply(0.55)
                     };
                     Stroke::new(1.2_f32, border_col)
-                } else if !pal.is_dark {
-                    Stroke::new(1.0_f32, Color32::from_rgb(186, 214, 255))
                 } else {
-                    Stroke::new(1.0_f32, Color32::from_rgb(53, 76, 104))
+                    Stroke::NONE
                 };
-                let rounding = Rounding::same(8.0);
+                let rounding = Rounding {
+                    se: 5.0,
+                    ..Rounding::same(18.0)
+                };
 
                 let mut card_action = None;
                 let mut quote_action = None;
@@ -2170,7 +2171,10 @@ pub(super) fn render_chat_bubble(
             } else {
                 Stroke::new(1.0_f32, pal.bubble_in_border)
             };
-            let rounding = Rounding::same(8.0);
+            let rounding = Rounding {
+                sw: 5.0,
+                ..Rounding::same(18.0)
+            };
 
             ui.vertical(|ui| {
                 ui.set_max_width(total_bubble_w);

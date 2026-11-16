@@ -1,9 +1,6 @@
 use super::*;
 
-// ---------------------------------------------------------------------------
-// Semantic Design System Tokens (UI/UX Pro Max — Minimalism & Swiss Style)
-// ---------------------------------------------------------------------------
-
+/// Shared colors for the Telegram-inspired workspace and its translucent surfaces.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct ThemePalette {
     pub(super) is_dark: bool,
@@ -36,33 +33,32 @@ pub(super) struct ThemePalette {
 
 impl ThemePalette {
     pub(super) fn dark() -> Self {
-        // Official Atom One Dark (`one-dark-ui` + `one-dark-syntax`) color system
         Self {
             is_dark: true,
             is_glass: false,
-            bg_app: Color32::from_rgb(24, 26, 31), // #181A1F Activity Bar & Title Bar
-            bg_sidebar: Color32::from_rgb(33, 37, 43), // #21252B Tree-View / Sidebar / Header
-            bg_chat_canvas: Color32::from_rgb(40, 44, 52), // #282C34 Atom One Dark Editor Canvas
-            bg_elevated: Color32::from_rgb(44, 49, 58), // #2C313A Elevated Card / Modal / Popover
-            bg_hover: Color32::from_rgb(50, 56, 66), // #323842 List Hover Surface
-            bg_selected: Color32::from_rgb(58, 63, 75), // #3A3F4B Active Selection Row
-            bg_input: Color32::from_rgb(29, 31, 35), // #1D1F23 Input / Search Well
-            border: Color32::from_rgb(52, 57, 66), // #343942 Subtle Panel Divider
-            text_primary: Color32::from_rgb(215, 218, 224), // #D7DAE0 Bright Foreground
-            text_secondary: Color32::from_rgb(171, 178, 191), // #ABB2BF Atom @mono-1
-            text_muted: Color32::from_rgb(118, 126, 142), // #767E8E Atom @mono-3 (readable muted)
-            primary: Color32::from_rgb(82, 139, 255), // #528BFF Atom UI Accent Blue
-            primary_hover: Color32::from_rgb(97, 175, 239), // #61AFEF Atom @hue-2 Cyan-Blue
-            accent_online: Color32::from_rgb(152, 195, 121), // #98C379 Atom @hue-4 Green
-            danger: Color32::from_rgb(224, 108, 117), // #E06C75 Atom @hue-5 Coral Red
-            warning: Color32::from_rgb(229, 192, 123), // #E5C07B Atom @hue-62 Warm Gold
-            bubble_out_bg: Color32::from_rgb(37, 55, 77), // #25374D Zalo Dark Slate-Navy Outgoing Bubble
-            bubble_out_text: Color32::from_rgb(235, 240, 246), // #EBF0F6
-            bubble_out_meta: Color32::from_rgb(154, 171, 192), // #9AABC0
-            bubble_in_bg: Color32::from_rgb(50, 56, 66),  // #323842 Atom Elevated Incoming Bubble
-            bubble_in_border: Color32::from_rgb(62, 68, 81), // #3E4451 Atom Gutter Border
-            bubble_in_text: Color32::from_rgb(215, 218, 224), // #D7DAE0
-            bubble_in_meta: Color32::from_rgb(142, 150, 165), // #8E96A5
+            bg_app: Color32::from_rgb(25, 35, 40),
+            bg_sidebar: Color32::from_rgb(30, 43, 48),
+            bg_chat_canvas: Color32::from_rgb(31, 52, 47),
+            bg_elevated: Color32::from_rgb(43, 60, 63),
+            bg_hover: Color32::from_rgb(47, 65, 68),
+            bg_selected: Color32::from_rgb(48, 87, 108),
+            bg_input: Color32::from_rgb(44, 59, 64),
+            border: Color32::from_rgb(57, 74, 77),
+            text_primary: Color32::from_rgb(240, 245, 244),
+            text_secondary: Color32::from_rgb(181, 199, 198),
+            text_muted: Color32::from_rgb(146, 169, 168),
+            primary: Color32::from_rgb(46, 158, 221),
+            primary_hover: Color32::from_rgb(86, 184, 237),
+            accent_online: Color32::from_rgb(129, 205, 149),
+            danger: Color32::from_rgb(244, 123, 131),
+            warning: Color32::from_rgb(233, 192, 116),
+            bubble_out_bg: Color32::from_rgb(55, 91, 76),
+            bubble_out_text: Color32::from_rgb(241, 250, 240),
+            bubble_out_meta: Color32::from_rgb(175, 212, 173),
+            bubble_in_bg: Color32::from_rgb(43, 60, 60),
+            bubble_in_border: Color32::from_rgb(57, 76, 73),
+            bubble_in_text: Color32::from_rgb(240, 245, 244),
+            bubble_in_meta: Color32::from_rgb(159, 182, 176),
         }
     }
 
@@ -72,27 +68,27 @@ impl ThemePalette {
             is_glass: false,
             bg_app: Color32::from_rgb(255, 255, 255), // #FFFFFF
             bg_sidebar: Color32::from_rgb(255, 255, 255), // #FFFFFF
-            bg_chat_canvas: Color32::from_rgb(235, 240, 247), // Authentic Zalo PC cool blue-gray canvas
-            bg_elevated: Color32::from_rgb(255, 255, 255),    // #FFFFFF
-            bg_hover: Color32::from_rgb(241, 245, 249),       // #F1F5F9
-            bg_selected: Color32::from_rgb(229, 241, 255),    // #E5F1FF Zalo active row
-            bg_input: Color32::from_rgb(248, 250, 252),       // #F8FAFC
-            border: Color32::from_rgb(226, 232, 240),         // #E2E8F0
-            text_primary: Color32::from_rgb(15, 23, 42),      // #0F172A (16.1:1 contrast)
-            text_secondary: Color32::from_rgb(71, 85, 105),   // #475569 (7.2:1 contrast)
-            text_muted: Color32::from_rgb(100, 116, 139),     // #64748B (4.6:1 contrast)
-            primary: Color32::from_rgb(0, 104, 255),          // #0068FF Zalo Blue
-            primary_hover: Color32::from_rgb(37, 99, 235),    // #2563EB
-            accent_online: Color32::from_rgb(5, 150, 105),    // #059669 Emerald
-            danger: Color32::from_rgb(220, 38, 38),           // #DC2626
-            warning: Color32::from_rgb(217, 119, 6),          // #D97706
-            bubble_out_bg: Color32::from_rgb(229, 239, 255), // Zalo Desktop Light Outgoing (#E5EFFF)
-            bubble_out_text: Color32::from_rgb(15, 23, 42),  // Crisp dark text on light blue (14:1)
-            bubble_out_meta: Color32::from_rgb(71, 92, 122),
+            bg_chat_canvas: Color32::from_rgb(188, 211, 175),
+            bg_elevated: Color32::from_rgb(255, 255, 255),
+            bg_hover: Color32::from_rgb(240, 245, 243),
+            bg_selected: Color32::from_rgb(222, 239, 248),
+            bg_input: Color32::from_rgb(243, 246, 245),
+            border: Color32::from_rgb(224, 232, 228),
+            text_primary: Color32::from_rgb(27, 42, 43),
+            text_secondary: Color32::from_rgb(88, 110, 109),
+            text_muted: Color32::from_rgb(105, 124, 122),
+            primary: Color32::from_rgb(38, 139, 205),
+            primary_hover: Color32::from_rgb(26, 119, 182),
+            accent_online: Color32::from_rgb(52, 149, 88),
+            danger: Color32::from_rgb(218, 67, 80),
+            warning: Color32::from_rgb(178, 118, 29),
+            bubble_out_bg: Color32::from_rgb(232, 255, 215),
+            bubble_out_text: Color32::from_rgb(28, 46, 28),
+            bubble_out_meta: Color32::from_rgb(65, 126, 60),
             bubble_in_bg: Color32::WHITE,
-            bubble_in_border: Color32::from_rgb(216, 224, 236),
-            bubble_in_text: Color32::from_rgb(15, 23, 42),
-            bubble_in_meta: Color32::from_rgb(100, 116, 139),
+            bubble_in_border: Color32::from_rgb(225, 234, 222),
+            bubble_in_text: Color32::from_rgb(27, 42, 43),
+            bubble_in_meta: Color32::from_rgb(105, 124, 122),
         }
     }
 
@@ -104,37 +100,33 @@ impl ThemePalette {
         if self.is_dark {
             Self {
                 is_glass: true,
-                bg_app: rgba(16, 18, 24, 150),
-                bg_sidebar: rgba(22, 25, 32, 140),
-                bg_chat_canvas: rgba(12, 14, 20, 105),
-                bg_elevated: rgba(38, 42, 52, 225),
+                bg_app: rgba(25, 37, 39, 215),
+                bg_sidebar: rgba(34, 51, 50, 220),
+                bg_chat_canvas: rgba(32, 58, 46, 130),
+                bg_elevated: rgba(43, 63, 59, 242),
                 bg_hover: rgba(255, 255, 255, 22),
-                bg_selected: rgba(82, 139, 255, 70),
-                bg_input: rgba(255, 255, 255, 18),
-                border: rgba(255, 255, 255, 34),
-                bubble_out_bg: rgba(64, 118, 255, 165),
-                bubble_out_text: Color32::WHITE,
-                bubble_out_meta: rgba(225, 235, 255, 200),
-                bubble_in_bg: rgba(255, 255, 255, 26),
-                bubble_in_border: rgba(255, 255, 255, 40),
+                bg_selected: rgba(66, 137, 169, 115),
+                bg_input: rgba(255, 255, 255, 20),
+                border: rgba(225, 255, 231, 42),
+                bubble_out_bg: rgba(68, 107, 77, 238),
+                bubble_in_bg: rgba(46, 65, 59, 245),
+                bubble_in_border: rgba(230, 255, 231, 24),
                 ..self
             }
         } else {
             Self {
                 is_glass: true,
-                bg_app: rgba(255, 255, 255, 120),
-                bg_sidebar: rgba(255, 255, 255, 140),
-                bg_chat_canvas: rgba(240, 245, 255, 80),
-                bg_elevated: rgba(255, 255, 255, 230),
+                bg_app: rgba(248, 255, 246, 220),
+                bg_sidebar: rgba(250, 255, 248, 230),
+                bg_chat_canvas: rgba(173, 205, 151, 125),
+                bg_elevated: rgba(250, 255, 247, 246),
                 bg_hover: rgba(0, 0, 0, 14),
-                bg_selected: rgba(0, 104, 255, 40),
-                bg_input: rgba(255, 255, 255, 150),
-                border: rgba(255, 255, 255, 170),
-                bubble_out_bg: rgba(0, 104, 255, 215),
-                bubble_out_text: Color32::WHITE,
-                bubble_out_meta: rgba(230, 240, 255, 215),
-                bubble_in_bg: rgba(255, 255, 255, 185),
-                bubble_in_border: rgba(255, 255, 255, 220),
+                bg_selected: rgba(61, 153, 210, 36),
+                bg_input: rgba(255, 255, 255, 160),
+                border: rgba(255, 255, 255, 180),
+                bubble_out_bg: rgba(235, 255, 220, 246),
+                bubble_in_bg: rgba(255, 255, 255, 248),
+                bubble_in_border: rgba(255, 255, 255, 150),
                 ..self
             }
         }

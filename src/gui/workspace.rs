@@ -33,9 +33,9 @@ impl ZaloGuiApp {
         // -------------------------------------------------------------------
         let screen_rect = ctx.screen_rect();
         let screen_w = screen_rect.width();
-        let is_compact_w = false;
-        let is_narrow_w = false;
-        let left_rail_w = 62.0;
+        let is_compact_w = screen_w < 980.0;
+        let is_narrow_w = screen_w < 680.0;
+        let left_rail_w = if is_narrow_w { 52.0 } else { 60.0 };
 
         // -------------------------------------------------------------------
         // 1. LEFT NAVIGATION RAIL (Replaces top bar & bottom bar)
@@ -462,7 +462,13 @@ impl ZaloGuiApp {
         // -------------------------------------------------------------------
         // 2. CONVERSATION LIST SIDEBAR (Responsive width, auto-adapts on resize)
         // -------------------------------------------------------------------
-        let sidebar_exact_w = 300.0_f32;
+        let sidebar_exact_w = if is_narrow_w {
+            76.0_f32
+        } else if is_compact_w {
+            280.0
+        } else {
+            310.0
+        };
         let sidebar_id = "conversation_sidebar_fixed";
         egui::SidePanel::left(sidebar_id)
             .resizable(false)
@@ -483,6 +489,15 @@ impl ZaloGuiApp {
                         bottom: 0.0,
                     })
                     .show(ui, |ui| {
+                        if !is_narrow_w {
+                            ui.label(
+                                RichText::new("Trò chuyện")
+                                    .size(18.0)
+                                    .color(pal.text_primary)
+                                    .strong(),
+                            );
+                            ui.add_space(10.0);
+                        }
                         if is_narrow_w {
                             // Compact mode: icon-only search / lookup button
                             ui.vertical_centered(|ui| {
@@ -524,12 +539,12 @@ impl ZaloGuiApp {
                                 );
                                 ui.painter().rect_filled(
                                     sbox_rect,
-                                    Rounding::same(8.0),
+                                    Rounding::same(18.0),
                                     pal.bg_input,
                                 );
                                 ui.painter().rect_stroke(
                                     sbox_rect,
-                                    Rounding::same(8.0),
+                                    Rounding::same(18.0),
                                     Stroke::new(
                                         1.0_f32,
                                         if has_q {
@@ -561,7 +576,7 @@ impl ZaloGuiApp {
                                     egui::TextEdit::singleline(&mut self.search_query)
                                         .id(Id::new("sidebar_search_input"))
                                         .frame(false)
-                                        .hint_text("Tìm hội thoại, tin nhắn, SĐT...")
+                                        .hint_text("Tìm kiếm…")
                                         .desired_width(edit_rect.width()),
                                 );
                                 let is_ime_busy = self.ime_active || self.ime_just_committed;
@@ -999,7 +1014,7 @@ impl ZaloGuiApp {
                             let is_hidden = self.settings.hidden_threads.contains(&t.id)
                                 || t.presentation.hidden;
                             let cur_label = self.settings.thread_labels.get(&t.id).cloned();
-                            let row_height = if is_narrow_w { 50.0 } else { 58.0 };
+                            let row_height = if is_narrow_w { 58.0 } else { 64.0 };
                             let (alloc_rect, row_resp) = ui.allocate_exact_size(
                                 Vec2::new(row_target_w, row_height),
                                 Sense::click(),
@@ -1019,23 +1034,10 @@ impl ZaloGuiApp {
                                 Color32::TRANSPARENT
                             };
 
-                            ui.painter().rect_filled(row_rect, Rounding::same(11.0), bg);
-
-                            // Left active indicator bar (`w-1 bg-zalo-500 rounded-r-full`)
-                            if is_selected {
-                                let bar_rect = Rect::from_min_size(
-                                    Pos2::new(row_rect.left() + 1.0, row_rect.top() + 10.0),
-                                    Vec2::new(3.5, 38.0),
-                                );
-                                ui.painter().rect_filled(
-                                    bar_rect,
-                                    Rounding::same(2.0),
-                                    pal.primary,
-                                );
-                            }
+                            ui.painter().rect_filled(row_rect, Rounding::same(14.0), bg);
 
                             // Avatar circle with real user/group image & Cutout Status Dot
-                            let av_radius = if is_narrow_w { 18.0 } else { 20.5 };
+                            let av_radius = if is_narrow_w { 21.0 } else { 23.0 };
                             let avatar_center = if is_narrow_w {
                                 row_rect.center()
                             } else {
@@ -1081,7 +1083,6 @@ impl ZaloGuiApp {
                                 } else {
                                     pal.text_primary
                                 };
-                                let max_name_chars = if is_compact_w { 15 } else { 21 };
                                 let name_x = if t.is_group {
                                     draw_icon_contacts(
                                         ui.painter(),
@@ -1093,12 +1094,25 @@ impl ZaloGuiApp {
                                 } else {
                                     text_left
                                 };
-                                let display_name = truncate_chars(&t.name, max_name_chars);
-                                ui.painter().text(
+                                let time_width = ui.fonts(|f| {
+                                    f.layout_no_wrap(
+                                        t.time.clone(),
+                                        FontId::proportional(11.0),
+                                        pal.text_muted,
+                                    )
+                                    .size()
+                                    .x
+                                });
+                                let meta_width = time_width
+                                    + 20.0
+                                    + if is_pinned_cloud { 16.0 } else { 0.0 }
+                                    + if is_muted { 16.0 } else { 0.0 };
+                                paint_elided_text(
+                                    ui.painter(),
                                     Pos2::new(name_x, row_rect.top() + 12.0),
-                                    egui::Align2::LEFT_TOP,
-                                    display_name,
-                                    FontId::proportional(13.6),
+                                    &t.name,
+                                    row_rect.right() - name_x - meta_width,
+                                    14.0,
                                     name_color,
                                 );
 
@@ -1172,19 +1186,14 @@ impl ZaloGuiApp {
                                     t.preview.clone()
                                 };
                                 let unread_n = self.unread_counts.get(&t.id).copied().unwrap_or(0);
-                                let max_snip_chars = if is_compact_w {
-                                    16
-                                } else if unread_n > 0 {
-                                    23
-                                } else {
-                                    28
-                                };
-                                let snippet = truncate_chars(&raw_preview, max_snip_chars);
-                                ui.painter().text(
+                                paint_elided_text(
+                                    ui.painter(),
                                     Pos2::new(text_left, row_rect.top() + 33.5),
-                                    egui::Align2::LEFT_TOP,
-                                    snippet,
-                                    FontId::proportional(12.0),
+                                    &raw_preview,
+                                    row_rect.right()
+                                        - text_left
+                                        - if unread_n > 0 { 36.0 } else { 12.0 },
+                                    12.0,
                                     if unread_n > 0 {
                                         pal.text_primary
                                     } else {
@@ -1208,7 +1217,7 @@ impl ZaloGuiApp {
                                     ui.painter().rect_filled(
                                         b_rect,
                                         Rounding::same(8.5),
-                                        pal.danger,
+                                        pal.primary,
                                     );
                                     ui.painter().text(
                                         b_rect.center(),
@@ -2268,6 +2277,7 @@ impl ZaloGuiApp {
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(pal.bg_chat_canvas))
             .show(ctx, |ui| {
+                paint_chat_backdrop(ui.painter(), ui.max_rect(), pal, &self.chat_appearance, self.chat_wallpaper.as_ref());
                 if let Some((thread_id, thread_name, thread_avatar, is_group, _msg_count)) =
                     thread_meta
                 {
@@ -2291,11 +2301,10 @@ impl ZaloGuiApp {
                             .copied()
                             .unwrap_or(crate::chat::FriendshipStatus::Unknown)
                     };
-                    // 1. Clean Conversation Header Bar (No raw 19-digit ID, no bulky sync button)
-                    egui::Frame::none()
-                        .fill(pal.bg_sidebar)
-                        .inner_margin(Margin::symmetric(18.0, 11.0))
-                        .stroke(Stroke::new(1.0_f32, pal.border))
+                    // Floating chrome leaves the wallpaper visible around the conversation header.
+                    floating_surface(pal, 28.0)
+                        .outer_margin(Margin::symmetric(14.0, 8.0))
+                        .inner_margin(Margin::symmetric(16.0, 9.0))
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
                                 // Header Avatar (40x40) with Cutout Online Dot
@@ -2345,7 +2354,8 @@ impl ZaloGuiApp {
                                                 )
                                                 .truncate(),
                                             );
-                                            if !is_compact_w && left_info_w > 170.0 {
+                                            if !is_compact_w && left_info_w > 170.0
+                                                && cur_friendship != crate::chat::FriendshipStatus::Friend {
                                                 let (tag_lbl, tag_fg, tag_bg) =
                                                     if is_cloud_thread {
                                                         (
@@ -3229,7 +3239,7 @@ impl ZaloGuiApp {
                     // The sticker strip is a true floating overlay (`egui::Area`) above the composer bar
                     // (matching Zalo PC's `PopoverIdentitiesDefine.STICKER_SUGGESTION`), so the message scroll
                     // area and composer input box never shift or lose IME focus while typing.
-                    let picker_reserve = (if self.sticker_picker_open { 268.0 } else { 0.0 })
+                    let picker_reserve = (if self.sticker_picker_open { 280.0 } else { 0.0 })
                         + (if self.replying_to.is_some() { 48.0 } else { 0.0 })
                         + (if self.pending_clipboard_image.is_some() {
                             64.0
@@ -3289,7 +3299,7 @@ impl ZaloGuiApp {
                         .clamp(1, 5);
                     let composer_extra_h = (composer_lines.saturating_sub(1) as f32) * 20.0;
                     let msg_area_height = (ui.available_height()
-                        - 68.0
+                        - 84.0
                         - composer_extra_h
                         - picker_reserve)
                         .max(100.0);
@@ -3946,11 +3956,9 @@ impl ZaloGuiApp {
                         }
                     }
 
-                    // 4. Bottom Message Composer Bar (Compact Icon Actions + Spacious Input + Padded Send Button)
-                    let composer_frame = egui::Frame::none()
-                        .fill(pal.bg_sidebar)
-                        .inner_margin(Margin::symmetric(14.0, 10.0))
-                        .stroke(Stroke::new(1.0_f32, pal.border))
+                    let composer_frame = floating_surface(pal, 28.0)
+                        .outer_margin(Margin::symmetric(14.0, 8.0))
+                        .inner_margin(Margin::symmetric(8.0, 8.0))
                         .show(ui, |ui| {
                             // Handle drag-and-drop files onto the chat window
                             let dropped: Vec<std::path::PathBuf> = ui.ctx().input(|i| {
@@ -4003,9 +4011,6 @@ impl ZaloGuiApp {
                             }
 
                             egui::Frame::none()
-                                .fill(pal.bg_input)
-                                .rounding(Rounding::same(11.0))
-                                .stroke(Stroke::new(1.0_f32, pal.border))
                                 .inner_margin(Margin::symmetric(8.0, 5.0))
                                 .show(ui, |ui| {
                                     let mut send_clicked = false;
@@ -4157,8 +4162,7 @@ impl ZaloGuiApp {
                                                 Stroke::new(1.0_f32, pal.border),
                                             );
 
-                                            let send_btn_w =
-                                                if is_narrow_w { 52.0 } else { 76.0 };
+                                            let send_btn_w = 34.0;
                                             let sched_btn_w = 34.0;
                                             let input_w = (ui.available_width()
                                                 - send_btn_w
@@ -4298,38 +4302,17 @@ impl ZaloGuiApp {
                                             };
                                             ui.painter().rect_filled(
                                                 send_rect,
-                                                Rounding::same(8.0),
+                                                Rounding::same(17.0),
                                                 send_bg,
                                             );
-                                            if !is_narrow_w {
-                                                ui.painter().text(
-                                                    Pos2::new(
-                                                        send_rect.left() + 15.0,
-                                                        send_rect.center().y,
-                                                    ),
-                                                    egui::Align2::LEFT_CENTER,
-                                                    "Gửi",
-                                                    FontId::proportional(13.0),
-                                                    Color32::WHITE,
-                                                );
-                                                draw_icon_send(
-                                                    ui.painter(),
-                                                    Pos2::new(
-                                                        send_rect.right() - 17.0,
-                                                        send_rect.center().y,
-                                                    ),
-                                                    14.0,
-                                                    Color32::WHITE,
-                                                );
-                                            } else {
-                                                draw_icon_send(
-                                                    ui.painter(),
-                                                    send_rect.center(),
-                                                    16.0,
-                                                    Color32::WHITE,
-                                                );
-                                            }
+                                            draw_icon_send(
+                                                ui.painter(),
+                                                send_rect.center(),
+                                                16.0,
+                                                Color32::WHITE,
+                                            );
                                             send_clicked = send_resp
+                                                .on_hover_text("Gửi tin nhắn · Nhấp phải để hẹn giờ")
                                                 .on_hover_cursor(if can_send {
                                                     CursorIcon::PointingHand
                                                 } else {

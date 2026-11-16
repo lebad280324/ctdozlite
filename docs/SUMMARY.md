@@ -3,5 +3,6 @@
 - [Tính năng & giới hạn](TINH_NANG.md)
 - [Cài đặt](CAI_DAT.md)
 - [Hướng dẫn sử dụng](HUONG_DAN_SU_DUNG.md)
+- [Giao diện macOS native](MACOS_NATIVE.md)
 - [Xử lý sự cố](KHAC_PHUC_SU_CO.md)
 - [Đã biết](DA_BIET.md)

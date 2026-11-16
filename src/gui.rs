@@ -21,15 +21,20 @@ use crate::logger::{self, FindingLevel, LogEntry, ScanFinding};
 use crate::qr::QrLogin;
 use crate::session::Session;
 
+mod appearance;
 mod messages;
 mod modals;
 mod stickers;
+mod surfaces;
 mod theme;
 mod worker;
 mod workspace;
 
+use appearance::*;
+pub use appearance::{ChatAppearance, WallpaperImage};
 use messages::*;
 use stickers::*;
+use surfaces::*;
 use theme::*;
 pub use theme::{emoji_to_tex_key, load_app_icon, lucide, REACTION_LIST};
 pub use worker::WorkerCmd;
@@ -40,6 +45,15 @@ fn merge_sent_message(thread: &mut Thread, message: ChatMessage) {
 }
 
 pub enum GuiEvent {
+    /// Terminal response to loading local appearance preferences.
+    ChatAppearanceLoaded(Result<ChatAppearance, String>),
+    /// Terminal response to persisting local appearance preferences.
+    ChatAppearanceSaved(Result<(), String>),
+    /// A decoded local wallpaper, cancellation, or error for a specific request.
+    ChatWallpaperLoaded {
+        request_id: u64,
+        result: Result<Option<WallpaperImage>, String>,
+    },
     /// Terminal response for a Settings authorization action.
     NotificationAuthorization {
         request_id: u64,
@@ -474,6 +488,12 @@ pub struct GuiTx {
 }
 
 impl GuiTx {
+    /// Adapt an owned event receiver to the legacy media/call engine.
+    /// Native clients may use a detached context; no egui window is created.
+    pub fn new(tx: Sender<GuiEvent>, ctx: egui::Context) -> Self {
+        Self { tx, ctx }
+    }
+
     /// Same contract as `Sender::send` (callers already `let _ =` it), plus the wake-up.
     #[allow(clippy::result_large_err)]
     pub fn send(&self, ev: GuiEvent) -> Result<(), std::sync::mpsc::SendError<GuiEvent>> {
@@ -514,6 +534,12 @@ pub struct ZaloGuiApp {
     search_query: String,
     input_message: String,
     status_msg: String,
+    chat_appearance: ChatAppearance,
+    chat_wallpaper: Option<TextureHandle>,
+    appearance_loaded: bool,
+    appearance_save_at: Option<std::time::Instant>,
+    wallpaper_request_id: u64,
+    wallpaper_loading: bool,
 
     // Reply / forward state
     replying_to: Option<ChatMessage>,
@@ -814,6 +840,12 @@ impl ZaloGuiApp {
             .unwrap_or(0);
 
         let app = Self {
+            chat_appearance: ChatAppearance::default(),
+            chat_wallpaper: None,
+            appearance_loaded: false,
+            appearance_save_at: None,
+            wallpaper_request_id: 0,
+            wallpaper_loading: false,
             dark_mode,
             theme_dirty: false,
             vibrancy_on,
@@ -973,6 +1005,10 @@ impl ZaloGuiApp {
         ensure_cjk_font(&cc.egui_ctx, thread_texts(&app.threads));
 
         if let Some(wtx) = WORKER_TX.get() {
+            if wtx.send(WorkerCmd::LoadChatAppearance).is_err() {
+                app.appearance_loaded = true;
+                app.show_toast("Không thể tải cài đặt nền chat.");
+            }
             if is_logged_in {
                 let _ = wtx.send(WorkerCmd::RefreshThreads);
             } else {
@@ -1043,6 +1079,49 @@ impl ZaloGuiApp {
     fn check_events(&mut self, ctx: &egui::Context) {
         while let Ok(event) = self.event_rx.try_recv() {
             match event {
+                GuiEvent::ChatAppearanceLoaded(result) => {
+                    self.appearance_loaded = true;
+                    match result {
+                        Ok(appearance) => {
+                            self.chat_appearance = appearance;
+                            if let Some(path) = self.chat_appearance.wallpaper.clone() {
+                                self.wallpaper_request_id =
+                                    self.wallpaper_request_id.wrapping_add(1);
+                                self.wallpaper_loading =
+                                    self.send_appearance_command(WorkerCmd::LoadChatWallpaper {
+                                        request_id: self.wallpaper_request_id,
+                                        path: Some(path),
+                                    });
+                            }
+                        }
+                        Err(error) => self.show_toast(error),
+                    }
+                }
+                GuiEvent::ChatAppearanceSaved(result) => {
+                    if let Err(error) = result {
+                        self.show_toast(error);
+                    }
+                }
+                GuiEvent::ChatWallpaperLoaded { request_id, result } => {
+                    // Resetting the background invalidates an older picker/decode still in flight.
+                    if request_id != self.wallpaper_request_id {
+                        continue;
+                    }
+                    self.wallpaper_loading = false;
+                    match result {
+                        Ok(Some(wallpaper)) => {
+                            self.chat_wallpaper = Some(ctx.load_texture(
+                                "chat_wallpaper",
+                                wallpaper.image,
+                                TextureOptions::LINEAR,
+                            ));
+                            self.chat_appearance.wallpaper = Some(wallpaper.path);
+                            self.queue_appearance_save();
+                        }
+                        Ok(None) => {}
+                        Err(error) => self.show_toast(error),
+                    }
+                }
                 GuiEvent::NotificationAuthorization { request_id, result } => {
                     self.notification_authorization.finish(request_id, result);
                 }
@@ -1945,7 +2024,9 @@ impl eframe::App for ZaloGuiApp {
             }
             std::process::exit(0);
         }
-        if ctx.input(|i| (i.modifiers.ctrl || i.modifiers.command) && i.modifiers.shift && i.key_pressed(Key::P)) {
+        if ctx.input(|i| {
+            (i.modifiers.ctrl || i.modifiers.command) && i.modifiers.shift && i.key_pressed(Key::P)
+        }) {
             self.settings_modal_open = true;
             self.settings_tab = SettingsTab::Privacy;
         }
@@ -1955,6 +2036,18 @@ impl eframe::App for ZaloGuiApp {
         }
 
         self.check_events(ctx);
+        if let Some(changed_at) = self.appearance_save_at {
+            if changed_at.elapsed() >= Duration::from_millis(400)
+                && !ctx.input(|i| i.pointer.any_down())
+            {
+                self.appearance_save_at = None;
+                self.send_appearance_command(WorkerCmd::SaveChatAppearance(
+                    self.chat_appearance.clone(),
+                ));
+            } else {
+                ctx.request_repaint_after(Duration::from_millis(400));
+            }
+        }
 
         self.ime_just_committed = false;
         ctx.input_mut(|i| {

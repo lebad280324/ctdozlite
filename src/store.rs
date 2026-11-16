@@ -57,6 +57,14 @@ impl MessageStore {
             Connection::open(path)?
         };
 
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if version > 2 {
+            anyhow::bail!("Cơ sở dữ liệu mới hơn phiên bản ứng dụng. Hãy cập nhật ứng dụng.");
+        }
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        conn.pragma_update(None, "busy_timeout", 5000)?;
+        conn.pragma_update(None, "foreign_keys", true)?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS messages (
                 msg_id TEXT PRIMARY KEY,
@@ -88,7 +96,52 @@ impl MessageStore {
             )?;
         }
 
+        if conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))? < 2 {
+            // Native workspace preferences are account-scoped by the owning database;
+            // legacy message columns remain unchanged and no historical rows are rebuilt.
+            conn.execute_batch(
+                "BEGIN IMMEDIATE;
+                 CREATE TABLE IF NOT EXISTS native_local_preferences (
+                    preference_key TEXT PRIMARY KEY,
+                    preference_json TEXT NOT NULL
+                 );
+                 PRAGMA user_version = 2;
+                 COMMIT;",
+            )?;
+        }
         Ok(Self { conn })
+    }
+
+    /// Read one bounded native preference document from this account's store.
+    ///
+    /// # Errors
+    /// Returns SQLite or oversized-document errors.
+    pub fn native_preference(&self, key: &str) -> Result<Option<String>> {
+        use rusqlite::OptionalExtension;
+        let value: Option<String> = self.conn.query_row(
+            "SELECT preference_json FROM native_local_preferences WHERE preference_key = ?1",
+            params![key], |row| row.get(0),
+        ).optional()?;
+        if value.as_ref().is_some_and(|value| value.len() > 2 * 1024 * 1024) {
+            anyhow::bail!("Dữ liệu tùy chọn quá lớn.");
+        }
+        Ok(value)
+    }
+
+    /// Atomically replace a bounded native preference document without touching history.
+    ///
+    /// # Errors
+    /// Returns validation or SQLite errors.
+    pub fn set_native_preference(&self, key: &str, value: &str) -> Result<()> {
+        if key.is_empty() || key.len() > 128 || value.len() > 2 * 1024 * 1024 {
+            anyhow::bail!("Dữ liệu tùy chọn không hợp lệ.");
+        }
+        self.conn.execute(
+            "INSERT INTO native_local_preferences(preference_key, preference_json) VALUES (?1, ?2)
+             ON CONFLICT(preference_key) DO UPDATE SET preference_json = excluded.preference_json",
+            params![key, value],
+        )?;
+        Ok(())
     }
 
     /// Insert a message. Returns `true` if a new row was inserted, `false` if already existed.
@@ -112,6 +165,12 @@ impl MessageStore {
             let _ = self.conn.execute(
                 "UPDATE messages SET raw_json = ?1, msg_type = ?2, text = ?4 WHERE msg_id = ?3",
                 params![msg.raw_json, msg.msg_type, msg.msg_id, msg.text],
+            );
+        } else if rows == 0 {
+            // Placeholders written by older importers give way to the readable text (re-notes/65).
+            let _ = self.conn.execute(
+                "UPDATE messages SET text = ?2 WHERE msg_id = ?1 AND text <> ?2 AND text IN ('📢 Thông báo hệ thống Zalo', '[Nội dung không hỗ trợ]')",
+                params![msg.msg_id, msg.text],
             );
         }
         Ok(rows > 0)
@@ -170,6 +229,14 @@ impl MessageStore {
 
     /// Search messages across all threads by keyword (case-insensitive substring match) (#35).
     pub fn search_messages(&self, query: &str, limit: usize) -> Result<Vec<StoredMessage>> {
+        self.search_messages_scoped(query, limit, None, false)
+    }
+
+    /// Search a bounded history window, filtering conversation and file kind before LIMIT.
+    ///
+    /// # Errors
+    /// Returns SQLite prepare or read errors.
+    pub fn search_messages_scoped(&self, query: &str, limit: usize, thread_id: Option<&str>, files_only: bool) -> Result<Vec<StoredMessage>> {
         let q = query.trim();
         if q.is_empty() {
             return Ok(Vec::new());
@@ -178,12 +245,15 @@ impl MessageStore {
         let mut stmt = self.conn.prepare(
             "SELECT msg_id, thread_id, sender_id, sender_name, text, msg_type, ts, is_outgoing, raw_json
              FROM messages
-             WHERE LOWER(text) LIKE LOWER(?1) ESCAPE '\\'
+             WHERE (?3 IS NULL OR thread_id = ?3)
+               AND (?4 = 0 OR msg_type IN ('chat.file','share.file','file'))
+               AND (LOWER(text) LIKE LOWER(?1) ESCAPE '\\'
                 OR LOWER(sender_name) LIKE LOWER(?1) ESCAPE '\\'
+                OR (?4 = 1 AND LOWER(raw_json) LIKE LOWER(?1) ESCAPE '\\'))
              ORDER BY ts DESC
              LIMIT ?2",
         )?;
-        let rows = stmt.query_map(params![pattern, limit as i64], |row| {
+        let rows = stmt.query_map(params![pattern, limit.min(1000) as i64, thread_id, files_only], |row| {
             let is_outgoing_num: i64 = row.get(7)?;
             Ok(StoredMessage {
                 msg_id: row.get(0)?,
@@ -238,7 +308,11 @@ impl MessageStore {
     }
 
     /// Retrieve the newest `limit` messages for a thread, ordered by timestamp ascending.
-    pub fn messages_for(&self, thread_id: &str, limit: usize) -> Result<Vec<StoredMessage>> {
+    /// Read a bounded, stable cursor page without scanning earlier pages.
+    ///
+    /// # Errors
+    /// Returns a SQLite error if the history cannot be read.
+    pub fn messages_before(&self, thread_id: &str, limit: usize, before: Option<(i64, &str)>) -> Result<Vec<StoredMessage>> {
         let mut stmt = self.conn.prepare(
             // Newest `limit` rows, returned oldest-first. `ORDER BY ts ASC LIMIT` handed back the
             // *oldest* rows, so a thread longer than the limit reopened on stale messages.
@@ -246,13 +320,13 @@ impl MessageStore {
              FROM (
                  SELECT msg_id, thread_id, sender_id, sender_name, text, msg_type, ts, is_outgoing, raw_json
                  FROM messages
-                 WHERE thread_id = ?1
-                 ORDER BY ts DESC
+                 WHERE thread_id = ?1 AND (ts, msg_id) < (?3, ?4)
+                 ORDER BY ts DESC, msg_id DESC
                  LIMIT ?2
-             ) ORDER BY ts ASC",
+             ) ORDER BY ts ASC, msg_id ASC",
         )?;
 
-        let rows = stmt.query_map(params![thread_id, limit as i64], |row| {
+        let rows = stmt.query_map(params![thread_id, limit as i64, before.map_or(i64::MAX, |v| v.0), before.map_or("\u{10ffff}", |v| v.1)], |row| {
             let is_outgoing_num: i64 = row.get(7)?;
             Ok(StoredMessage {
                 msg_id: row.get(0)?,
@@ -272,6 +346,54 @@ impl MessageStore {
             list.push(r?);
         }
         Ok(list)
+    }
+
+    /// Read the next bounded page after a stable timestamp and ID cursor.
+    ///
+    /// # Errors
+    /// Returns a SQLite error if the history cannot be read.
+    pub fn messages_after(&self, thread_id: &str, limit: usize, after: (i64, &str)) -> Result<Vec<StoredMessage>> {
+        let mut stmt = self.conn.prepare(
+            // Newest `limit` rows, returned oldest-first. `ORDER BY ts ASC LIMIT` handed back the
+            // *oldest* rows, so a thread longer than the limit reopened on stale messages.
+            "SELECT msg_id, thread_id, sender_id, sender_name, text, msg_type, ts, is_outgoing, raw_json
+             FROM (
+                 SELECT msg_id, thread_id, sender_id, sender_name, text, msg_type, ts, is_outgoing, raw_json
+                 FROM messages
+                 WHERE thread_id = ?1 AND (ts, msg_id) > (?3, ?4)
+                 ORDER BY ts ASC, msg_id ASC
+                 LIMIT ?2
+             ) ORDER BY ts ASC, msg_id ASC",
+        )?;
+
+        let rows = stmt.query_map(params![thread_id, limit as i64, after.0, after.1], |row| {
+            let is_outgoing_num: i64 = row.get(7)?;
+            Ok(StoredMessage {
+                msg_id: row.get(0)?,
+                thread_id: row.get(1)?,
+                sender_id: row.get(2).unwrap_or_default(),
+                sender_name: row.get(3).unwrap_or_default(),
+                text: row.get(4).unwrap_or_default(),
+                msg_type: row.get(5).unwrap_or_default(),
+                ts: row.get(6)?,
+                is_outgoing: is_outgoing_num != 0,
+                raw_json: row.get(8).unwrap_or_default(),
+            })
+        })?;
+
+        let mut list = Vec::new();
+        for r in rows {
+            list.push(r?);
+        }
+        Ok(list)
+    }
+
+    /// Return the newest bounded page, ordered oldest first.
+    ///
+    /// # Errors
+    /// Returns a SQLite error if the history cannot be read.
+    pub fn messages_for(&self, thread_id: &str, limit: usize) -> Result<Vec<StoredMessage>> {
+        self.messages_before(thread_id, limit, None)
     }
 
     /// Retrieve all persisted thread metadata ordered by `last_ts` descending.
@@ -355,6 +477,31 @@ impl MessageStore {
             }
         }
 
+        self.hydrate_loaded_threads(threads, limit_per_thread)
+    }
+
+    /// Load history only into the supplied conversations, without adding other
+    /// stored threads or migrating account-wide conversation identities.
+    ///
+    /// # Errors
+    /// Returns an error if SQLite cannot read or reconcile the requested history.
+    pub fn hydrate_loaded_threads(&self, threads: &mut Vec<Thread>, limit_per_thread: usize) -> Result<usize> {
+        self.hydrate_loaded_threads_before(threads, limit_per_thread, None)
+    }
+
+    /// Hydrate one cursor page into the supplied conversations.
+    ///
+    /// # Errors
+    /// Returns a SQLite error if the history cannot be read or reconciled.
+    pub fn hydrate_loaded_threads_before(&self, threads: &mut Vec<Thread>, limit_per_thread: usize, before: Option<(i64, &str)>) -> Result<usize> {
+        self.hydrate_loaded_threads_page(threads, limit_per_thread, before, None)
+    }
+
+    /// Hydrate a bounded page in either direction, preserving stable identities.
+    ///
+    /// # Errors
+    /// Returns a SQLite error if reading or reconciling the page fails.
+    pub fn hydrate_loaded_threads_page(&self, threads: &mut Vec<Thread>, limit_per_thread: usize, before: Option<(i64, &str)>, after: Option<(i64, &str)>) -> Result<usize> {
         // Primary-key lookups for the messages actually in memory. This used to load every
         // (msg_id, thread_id) row in the database into a HashMap on each call. One transaction
         // around them: in autocommit every SELECT takes and drops the file lock, ~50 µs on
@@ -364,14 +511,14 @@ impl MessageStore {
 
         let mut loaded_count = 0;
         for t in threads.iter_mut() {
-            let before = t.messages.len();
+            let previous_count = t.messages.len();
             let tid = t.id.clone();
             t.messages.retain(|m| {
                 owner_of
                     .query_row(params![m.id], |r| r.get::<_, String>(0))
                     .map_or(true, |owner| owner == tid)
             });
-            if t.messages.len() != before && t.messages.is_empty() {
+            if t.messages.len() != previous_count && t.messages.is_empty() {
                 t.preview.clear();
                 t.time.clear();
                 let _ = self.conn.execute(
@@ -379,7 +526,7 @@ impl MessageStore {
                     params![t.id],
                 );
             }
-            let saved_msgs = self.messages_for(&t.id, limit_per_thread)?;
+            let saved_msgs = if let Some(after) = after { self.messages_after(&t.id, limit_per_thread, after)? } else { self.messages_before(&t.id, limit_per_thread, before)? };
             for sm in saved_msgs {
                 let time = if sm.ts > 0 {
                     crate::clock::message_time(sm.ts)
@@ -393,6 +540,9 @@ impl MessageStore {
                 let mut reply_to_sender = None;
                 let mut reply_to_text = None;
                 let mut reactions = Vec::new();
+                let mut reaction_summaries: Vec<crate::reactions::ReactionSummary> = Vec::new();
+                let mut local_path: Option<String> = None;
+                let mut card: Option<serde_json::Value> = None;
                 let mut is_pinned = false;
                 let mut is_starred = false;
                 let mut link_url = None;
@@ -432,6 +582,10 @@ impl MessageStore {
                                 .filter_map(|v| v.as_str().map(str::to_string))
                                 .collect();
                         }
+                        if let Some(value) = val.get("reaction_summaries") {
+                            reaction_summaries =
+                                serde_json::from_value(value.clone()).unwrap_or_default();
+                        }
                         is_pinned = val
                             .get("is_pinned")
                             .and_then(|v| v.as_bool())
@@ -460,6 +614,11 @@ impl MessageStore {
                             .get("link_src")
                             .and_then(|v| v.as_str())
                             .map(str::to_string);
+                        local_path = val
+                            .get("local_path")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string);
+                        card = val.get("card").filter(|v| v.is_object()).cloned();
                     }
                 }
                 let cm = ChatMessage {
@@ -480,6 +639,9 @@ impl MessageStore {
                     reply_to_sender,
                     reply_to_text,
                     reactions,
+                    reaction_summaries,
+                    local_path,
+                    card,
                     is_pinned,
                     is_starred,
                     link_url,
@@ -491,10 +653,9 @@ impl MessageStore {
                     ..Default::default()
                 };
                 if let Some(existing) = t.messages.iter_mut().find(|existing| {
-                    (!existing.id.is_empty() && existing.id == cm.id)
-                        || (existing.text == cm.text
-                            && existing.is_outgoing == cm.is_outgoing
-                            && (existing.ts == cm.ts || (existing.ts != 0 && cm.ts != 0 && (existing.ts - cm.ts).abs() < 5000)))
+                    // Repeated text and close timestamps are not message identity.
+                    // Each stored server ID must remain visible after restore (INV-4).
+                    !existing.id.is_empty() && existing.id == cm.id
                 }) {
                     if existing.sticker_id.is_none() && cm.sticker_id.is_some() {
                         existing.sticker_id = cm.sticker_id;
@@ -506,6 +667,10 @@ impl MessageStore {
                         existing.reply_to_sender = cm.reply_to_sender;
                         existing.reply_to_text = cm.reply_to_text;
                     }
+                    if existing.card.is_none() && cm.card.is_some() {
+                        existing.card = cm.card.clone();
+                        existing.text = cm.text.clone();
+                    }
                     if existing.link_url.is_none() && cm.link_url.is_some() {
                         existing.link_url = cm.link_url;
                         existing.link_title = cm.link_title;
@@ -515,6 +680,12 @@ impl MessageStore {
                         if !cm.text.is_empty() {
                             existing.text = cm.text;
                         }
+                    }
+                    if existing.local_path.is_none() && cm.local_path.is_some() {
+                        existing.local_path = cm.local_path.clone();
+                    }
+                    if existing.reaction_summaries.is_empty() && !cm.reaction_summaries.is_empty() {
+                        existing.reaction_summaries = cm.reaction_summaries.clone();
                     }
                     if existing.reactions.is_empty() && !cm.reactions.is_empty() {
                         existing.reactions = cm.reactions;
@@ -568,6 +739,12 @@ impl From<&ChatMessage> for StoredMessage {
         if !m.reactions.is_empty() {
             meta.insert("reactions".into(), serde_json::json!(m.reactions));
         }
+        if !m.reaction_summaries.is_empty() {
+            // Per-reactor detail lets the UI show who reacted after a restart.
+            if let Ok(value) = serde_json::to_value(&m.reaction_summaries) {
+                meta.insert("reaction_summaries".into(), value);
+            }
+        }
         if m.is_pinned {
             meta.insert("is_pinned".into(), serde_json::json!(true));
         }
@@ -588,6 +765,12 @@ impl From<&ChatMessage> for StoredMessage {
         }
         if let Some(lsrc) = &m.link_src {
             meta.insert("link_src".into(), serde_json::json!(lsrc));
+        }
+        if let Some(local) = &m.local_path {
+            meta.insert("local_path".into(), serde_json::json!(local));
+        }
+        if let Some(card) = &m.card {
+            meta.insert("card".into(), card.clone());
         }
         let raw_json = if meta.is_empty() {
             String::new()
@@ -720,8 +903,24 @@ pub fn import_history_from_path(
                 }
             }
         }
-        let bytes = std::fs::read(&file_path)?;
-        if bytes.starts_with(b"SQLite format 3") {
+        let mut header = [0u8; 16];
+        let header_len = {
+            use std::io::Read;
+            let mut file = std::fs::File::open(&file_path)?;
+            let mut filled = 0;
+            while filled < header.len() {
+                let read = file.read(&mut header[filled..])?;
+                if read == 0 {
+                    break;
+                }
+                filled += read;
+            }
+            filled
+        };
+        // A SQLite source is opened in place; only other formats are read into memory.
+        let is_sqlite = header[..header_len].starts_with(b"SQLite format 3");
+        let bytes = if is_sqlite { Vec::new() } else { std::fs::read(&file_path)? };
+        if is_sqlite {
             let src_store = MessageStore::open(file_path.to_string_lossy().as_ref())?;
             let src_threads = src_store.all_threads().unwrap_or_default();
             dst.conn.execute_batch("BEGIN")?;
@@ -1296,6 +1495,15 @@ pub fn jxl_to_jpg_url(url: &str) -> String {
     without_flag.replace("/jxl/", "/jpg/").replace(".jxl", ".jpg")
 }
 
+/// Decode an already-plain Zalo PC message payload (text or attachment JSON) into
+/// display text and rendering metadata, as used by the `.zl.zip` export importer.
+pub(crate) fn zalo_pc_text_and_meta(
+    raw: &str,
+    mtype: i64,
+) -> (String, serde_json::Map<String, serde_json::Value>) {
+    extract_zalo_message_text_and_meta(raw, mtype)
+}
+
 fn extract_zalo_message_text_and_meta(
     xored: &str,
     mtype: i64,
@@ -1304,6 +1512,31 @@ fn extract_zalo_message_text_and_meta(
     if let Ok(val) = serde_json::from_str::<serde_json::Value>(xored) {
         if let Some(inner) = val.as_str() {
             return (inner.to_string(), meta);
+        }
+        // Contact cards, calls, event lines and official-account templates (re-notes/65).
+        if val.is_object() {
+            use crate::chat::RichCard;
+            match crate::chat::rich_card(&val) {
+                Some(RichCard::Contact { user_id, name, avatar, qr }) => {
+                    meta.insert("link_title".into(), serde_json::json!(name));
+                    if let Some(avatar) = &avatar {
+                        meta.insert("link_thumb".into(), serde_json::json!(avatar));
+                    }
+                    meta.insert("card".into(), serde_json::json!({"kind":"contact","user_id":user_id,"name":name,"avatar":avatar,"qr":qr}));
+                    return (format!("[Danh thiếp] {name}"), meta);
+                }
+                Some(RichCard::Call { duration, video, missed }) => {
+                    meta.insert("card".into(), serde_json::json!({"kind":"call","duration":duration,"video":video,"missed":missed}));
+                    // Direction is fixed by the importer, which knows the sender.
+                    return (crate::chat::call_text(duration, video, missed, true), meta);
+                }
+                Some(RichCard::Notice(text)) => {
+                    meta.insert("card".into(), serde_json::json!({"kind":"notice"}));
+                    return (text, meta);
+                }
+                Some(RichCard::Text(text)) => return (text, meta),
+                _ => {}
+            }
         }
         if let Some(arr) = val.as_array() {
             for item in arr {
@@ -1717,5 +1950,21 @@ mod tests {
             decode_zalo_cipher_payload(&enc, key),
             "Này bố kiểm tra mail xem ạ"
         );
+    }
+}
+
+#[cfg(test)]
+mod native_file_search_tests {
+    use super::*;
+    #[test]
+    fn filename_search_filters_type_and_thread_before_limit() {
+        let db=MessageStore::open(":memory:").unwrap();
+        for (id,thread,kind,ts) in [("text-1","other","chat.text",3),("file-2","other","share.file",2),("file-1","target","share.file",1)] {
+            db.conn.execute("INSERT INTO messages (msg_id,thread_id,sender_id,sender_name,text,msg_type,ts,is_outgoing,raw_json) VALUES (?1,?2,'sender','Example','report',?3,?4,0,?5)",params![id,thread,kind,ts,r#"{"fileName":"budget_2026.pdf"}"#]).unwrap();
+        }
+        let found=db.search_messages_scoped("budget_2026.pdf",1,Some("target"),true).unwrap();
+        assert_eq!(found.len(),1);assert_eq!(found[0].msg_id,"file-1");
+        assert!(db.search_messages_scoped("budget%",10,None,true).unwrap().is_empty());
+        assert_eq!(db.search_messages_scoped("report",10,None,true).unwrap().len(),2);
     }
 }
